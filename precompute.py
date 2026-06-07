@@ -48,17 +48,24 @@ def init_opencl() -> tuple[cl.Context, cl.CommandQueue, cl.Buffer, np.ndarray]:
     Initialise PyOpenCL context (Apple platform), upload M to GPU, return
     (ctx, queue, M_buf, M).
     """
-    # Pick first available platform / device (Apple = index 0 on macOS)
+    # Explicitly request GPU device — on Apple Silicon get_devices()[0] may be
+    # the OpenCL CPU device, which would explain 0% GPU in Activity Monitor.
     platform = cl.get_platforms()[0]
-    device   = platform.get_devices()[0]
-    ctx      = cl.Context([device])
-    queue    = cl.CommandQueue(ctx)
+    gpu_devs = platform.get_devices(device_type=cl.device_type.GPU)
+    if not gpu_devs:
+        raise RuntimeError(
+            "No OpenCL GPU device found on the default platform. "
+            "Available devices: " + str(platform.get_devices())
+        )
+    device = gpu_devs[0]
+    ctx   = cl.Context([device])
+    queue = cl.CommandQueue(ctx)
 
     M = build_eval_matrix()
     M_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
                       hostbuf=M)
     print(f"[precompute] OpenCL platform : {platform.name}")
-    print(f"[precompute] Device          : {device.name}")
+    print(f"[precompute] Device          : {device.name}  (type=GPU)")
     return ctx, queue, M_buf, M
 
 

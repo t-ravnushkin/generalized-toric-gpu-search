@@ -28,13 +28,8 @@ def idx(a: int, b: int) -> int:
 
 
 def append_result(record: dict, results_file: Path) -> None:
-    results: list[dict] = []
-    if results_file.exists():
-        with results_file.open() as f:
-            results = json.load(f)
-    results.append(record)
-    with results_file.open("w") as f:
-        json.dump(results, f, indent=2)
+    with results_file.open("a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def check_set(
@@ -184,5 +179,5 @@ if __name__ == "__main__":
     # without being pruned out by the Griesmer bound limits.
     print("\n" + "=" * 60 + "\nPART B — Global Batched BFS (target d=40)\n" + "=" * 60)
     t0 = time.perf_counter()
-    global_batched_bfs(40, oracle, lattice, RUN_FILE, max_k=8)
+    global_batched_bfs(30, oracle, lattice, RUN_FILE, max_k=8)
     print(f"\nTotal BFS time: {time.perf_counter() - t0:.1f}s")
