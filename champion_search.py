@@ -233,9 +233,16 @@ def global_batched_bfs(
 
         append_result({"type": "level_complete", "k": k}, results_file)
 
-        print(
-            f"  k={k} complete: {len(valid_next_level)} passed in {time.perf_counter() - t0:.1f}s"
-        )
+        elapsed = time.perf_counter() - t0
+        n_pass = len(valid_next_level)
+        print(f"  k={k} complete: {n_pass} passed in {elapsed:.1f}s")
+        if n_pass == 0:
+            print(
+                f"  *** level k={k} produced 0 survivors — BFS cannot continue. ***\n"
+                f"  Likely cause: target_d={td} is above what toric codes can achieve.\n"
+                f"  Fix: increase `margin` in the notebook (currently target = table_d - margin)."
+            )
+            break
         current_level = valid_next_level
 
 
