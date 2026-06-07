@@ -161,27 +161,13 @@ class DistanceOracle:
             [idx for subset in batched_indices for idx in subset], dtype=np.int32
         )
         out_np = np.zeros(num_sets, dtype=np.int32)
-<<<<<<< HEAD
 
         self._ensure_buffers(len(flat_indices), num_sets)
         s_buf = self._s_buf
         out_buf = self._out_buf
         assert s_buf is not None and out_buf is not None
-        # Upload inputs; zero the output region used this call.
         cl.enqueue_copy(self.queue, s_buf, flat_indices)
         cl.enqueue_copy(self.queue, out_buf, out_np)
-=======
-        s_buf = cl.Buffer(
-            self.ctx,
-            cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-            hostbuf=flat_indices,
-        )
-        out_buf = cl.Buffer(
-            self.ctx,
-            cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR,
-            hostbuf=out_np,
-        )
->>>>>>> main
 
         self._knl_batch(
             self.queue,
