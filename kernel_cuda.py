@@ -156,7 +156,7 @@ class DistanceOracleCUDA:
         self.device_id = device_id
         with cp.cuda.Device(device_id):
             self._M_gpu = cp.asarray(M.astype(np.int32))
-            module = cp.RawModule(code=_CUDA_SRC, options=("-O3",))
+            module = cp.RawModule(code=_CUDA_SRC)
             self._knl_single = module.get_function("eval_min_distance_single")
             self._knl_batch  = module.get_function("eval_min_distance_batch")
 
