@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -120,17 +121,65 @@ def check_set(
 # ---------------------------------------------------------------------------
 
 
-def global_batched_bfs(
+def _dispatch_batch(
+    oracles: list[DistanceOracle],
+    batch: list[list[int]],
     target_distance: int,
-    oracle: DistanceOracle,
+) -> list[int]:
+    """Split a batch across multiple DistanceOracle instances (one per GPU) using threads.
+    PyOpenCL releases the GIL during kernel dispatch, so threads run truly in parallel."""
+    n = len(oracles)
+    if n == 1:
+        return oracles[0].max_zeros_batch(batch, target_distance)
+
+    # Divide batch as evenly as possible across GPUs.
+    q, r = divmod(len(batch), n)
+    sizes = [q + (1 if i < r else 0) for i in range(n)]
+    chunks, start = [], 0
+    for s in sizes:
+        chunks.append(batch[start : start + s])
+        start += s
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = [
+            pool.submit(oracle.max_zeros_batch, chunk, target_distance)
+            for oracle, chunk in zip(oracles, chunks)
+            if chunk
+        ]
+        results: list[int] = []
+        for f in futures:
+            results.extend(f.result())
+    return results
+
+
+def global_batched_bfs(
+    target_distance: int | dict[int, int],
+    oracles: DistanceOracle | list[DistanceOracle],
     lattice: list[tuple[int, int]],
     results_file: Path,
     max_k: int = 10,
     resume: bool = True,
+    batch_size: int = BATCH_SIZE,
 ):
-    print(
-        f"\n=== Global Batched BFS  target_distance={target_distance}  max_k={max_k} ==="
-    )
+    """
+    oracles: single DistanceOracle or list (one per GPU for multi-GPU runs).
+    target_distance: fixed int, or {k: d} dict from codetables.bounds_for_n(n).
+    """
+    if isinstance(oracles, DistanceOracle):
+        oracles = [oracles]
+    n_gpus = len(oracles)
+
+    def _target(k: int) -> int:
+        if isinstance(target_distance, dict):
+            return target_distance.get(k, 1)
+        return target_distance
+
+    print(f"\n=== Global Batched BFS  max_k={max_k}  gpus={n_gpus} ===")
+    if isinstance(target_distance, dict):
+        preview = {k: target_distance[k] for k in sorted(target_distance)[:8]}
+        print(f"  Per-level targets (first 8): {preview}")
+    else:
+        print(f"  Fixed target_distance={target_distance}")
 
     if resume and results_file.exists():
         k, current_level = resume_level(results_file)
@@ -141,6 +190,7 @@ def global_batched_bfs(
 
     while current_level and k < max_k:
         k += 1
+        td = _target(k)
 
         next_candidates = []
         for S in current_level:
@@ -152,19 +202,19 @@ def global_batched_bfs(
             break
 
         total_candidates = len(next_candidates)
-        print(f"  Level {k}: {total_candidates} subsets. Batch size: {BATCH_SIZE}")
+        print(f"  Level {k}: {total_candidates} subsets  target_d={td}  batch={batch_size}")
 
         valid_next_level = []
         t0 = time.perf_counter()
-        tmax_zeros = 49 - target_distance
+        tmax_zeros = 49 - td
 
         for i in tqdm(
-            range(0, total_candidates, BATCH_SIZE),
+            range(0, total_candidates, batch_size),
             desc=f"k={k}",
             dynamic_ncols=True,
         ):
-            batch = next_candidates[i : i + BATCH_SIZE]
-            results = oracle.max_zeros_batch(batch, target_distance)
+            batch = next_candidates[i : i + batch_size]
+            results = _dispatch_batch(oracles, batch, td)
 
             for S_new, mz in zip(batch, results):
                 if mz <= tmax_zeros:
@@ -181,7 +231,6 @@ def global_batched_bfs(
                         results_file,
                     )
 
-        # Mark level complete so the next run can resume past it.
         append_result({"type": "level_complete", "k": k}, results_file)
 
         print(
@@ -230,9 +279,12 @@ def main(results_file: Path | None = None, resume: bool = True) -> Path:
     check_set("parabola_conic_k7", parabola_7, oracle, lattice, results_file,
               already_done=already_done)
 
-    print("\n" + "=" * 60 + "\nPART B — Global Batched BFS (target d=30)\n" + "=" * 60)
+    print("\n" + "=" * 60 + "\nPART B — Global Batched BFS (codetables targets)\n" + "=" * 60)
+    from codetables import bounds_for_n
+    targets = bounds_for_n(49)
+    print(f"  Loaded {len(targets)} per-k bounds from codetables.de")
     t0 = time.perf_counter()
-    global_batched_bfs(30, oracle, lattice, results_file, max_k=8, resume=resume)
+    global_batched_bfs(targets, oracle, lattice, results_file, max_k=8, resume=resume)
     print(f"\nTotal BFS time: {time.perf_counter() - t0:.1f}s")
 
     return results_file

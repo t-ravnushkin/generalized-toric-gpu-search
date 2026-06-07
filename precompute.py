@@ -43,6 +43,33 @@ def build_eval_matrix() -> np.ndarray:
     return M
 
 
+def _all_gpu_devices() -> list[tuple[cl.Platform, cl.Device]]:
+    return [
+        (platform, device)
+        for platform in cl.get_platforms()
+        for device in platform.get_devices(device_type=cl.device_type.GPU)
+    ]
+
+
+def init_opencl_all() -> tuple[list[tuple[cl.Context, cl.CommandQueue, cl.Buffer]], np.ndarray]:
+    """
+    Initialise one OpenCL context per available GPU.
+    Returns ([(ctx, queue, M_buf), ...], M).  Use this for multi-GPU setups.
+    """
+    pairs = _all_gpu_devices()
+    if not pairs:
+        raise RuntimeError("No OpenCL GPU devices found on any platform.")
+    M = build_eval_matrix()
+    result = []
+    for platform, device in pairs:
+        ctx   = cl.Context([device])
+        queue = cl.CommandQueue(ctx)
+        M_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=M)
+        print(f"[precompute] {platform.name} | {device.name}")
+        result.append((ctx, queue, M_buf))
+    return result, M
+
+
 def init_opencl() -> tuple[cl.Context, cl.CommandQueue, cl.Buffer, np.ndarray]:
     """
     Initialise PyOpenCL context, upload M to GPU, return (ctx, queue, M_buf, M).
