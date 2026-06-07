@@ -51,7 +51,7 @@ def check_set(
     t0 = time.perf_counter()
 
     # Use the new batched oracle with a batch of 1
-    mz = oracle.max_zeros_batch([s], target_distance=1)[0]
+    mz = oracle.max_zeros([s], target_distance=1)
     dt = (time.perf_counter() - t0) * 1e3
     d = 49 - mz
 
@@ -85,14 +85,12 @@ def global_batched_bfs(
         f"\n=== Global Batched BFS  target_distance={target_distance}  max_k={max_k} ==="
     )
 
-    # Start at origin to eliminate 49x translation symmetry
     current_level = [[0]]
     k = 1
 
     while current_level and k < max_k:
         next_k = k + 1
 
-        # 1. Canonical generation (No memory-leaking 'visited' set)
         next_candidates = []
         for S in current_level:
             last_p = S[-1]
@@ -103,15 +101,15 @@ def global_batched_bfs(
             break
 
         total_candidates = len(next_candidates)
-        threads_per_set = (8**next_k) - 1
-        batch_size = max(1, TARGET_TOTAL_THREADS // threads_per_set)
+
+        # Simpler, flat batch sizing. The GPU handles this beautifully now.
+        batch_size = 250_000
 
         print(f"  Level {next_k}: {total_candidates} subsets. Batch size: {batch_size}")
 
         valid_next_level = []
         t0 = time.perf_counter()
 
-        # 2. Process in chunks
         for i in tqdm(
             range(0, total_candidates, batch_size),
             desc=f"k={next_k}",
@@ -124,7 +122,6 @@ def global_batched_bfs(
             for S_new, mz in zip(batch, results):
                 if mz <= tmax_zeros:
                     valid_next_level.append(S_new)
-                    # Save local champions directly to disk
                     append_result(
                         {
                             "name": f"bfs_k{next_k}_d{49 - mz}",
