@@ -321,6 +321,8 @@ def run_evolution(
     seed: int,
     seed_sets: list[tuple[int, ...]],
     results_file: Path,
+    oracles_info: tuple | None = None,
+    log_every: int = 1,
 ) -> Path:
     if not (1 <= k <= N_POINTS):
         raise ValueError("k must be in 1..49")
@@ -332,7 +334,10 @@ def run_evolution(
         raise ValueError("sample-count must be positive for evolutionary search")
 
     rng = random.Random(seed)
-    oracles, default_batch, backend = init_oracles()
+    if oracles_info is None:
+        oracles, default_batch, backend = init_oracles()
+    else:
+        oracles, default_batch, backend = oracles_info
     batch_size = batch_size or default_batch
     lattice = bounding_cube_points()
 
@@ -395,11 +400,17 @@ def run_evolution(
         n_at_target = sum(1 for _, d, _ in scored if d >= target_d)
         avg_top = mean(d for _, d, _ in scored[: max(1, min(20, len(scored)))])
         elapsed = time.perf_counter() - t0
-        print(
-            f"gen {gen:4d}: best sampled d={best[1]:2d}  "
-            f"top20 avg={avg_top:5.2f}  pass={n_at_target:3d}  "
-            f"time={elapsed:5.1f}s"
+        show_generation = (
+            gen == 1
+            or gen == generations
+            or (log_every > 0 and gen % log_every == 0)
         )
+        if show_generation:
+            print(
+                f"gen {gen:4d}: best sampled d={best[1]:2d}  "
+                f"top20 avg={avg_top:5.2f}  pass={n_at_target:3d}  "
+                f"time={elapsed:5.1f}s"
+            )
 
         should_recheck = (
             recheck_sample_count > 0
@@ -442,7 +453,6 @@ def run_evolution(
                         "generation": gen,
                     }
                     append_jsonl(results_file, record)
-                    print(f"  candidate logged: d_sample={sampled_d}, rechecks={distances}")
 
         ranked_parent_pool = scored[: min(parent_pool, len(scored))]
         next_population = [item[0] for item in scored[:elite_count]]
@@ -495,6 +505,12 @@ def main() -> None:
     parser.add_argument("--recheck-rounds", type=int, default=3)
     parser.add_argument("--recheck-top", type=int, default=8)
     parser.add_argument("--recheck-every", type=int, default=10)
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="print progress every N generations; 0 prints only first and last",
+    )
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -533,6 +549,7 @@ def main() -> None:
         seed=args.seed,
         seed_sets=args.seed_set,
         results_file=results_file,
+        log_every=args.log_every,
     )
 
 
