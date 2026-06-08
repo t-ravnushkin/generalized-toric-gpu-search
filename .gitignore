@@ -7,4 +7,5 @@ kaggle*
 .pi
 
 *.json
+*.npz
 .*_cache.txt
