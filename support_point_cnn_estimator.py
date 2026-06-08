@@ -1,10 +1,10 @@
 r"""Prototype support-point CNN estimator for GF(8) toric-code searches.
 
 This module is intentionally lightweight: it uses NumPy only and implements a
-small CNN-style feature extractor (fixed 3x3 convolution filters + global
-pooling) followed by ridge regression.  It is meant to rank candidate support
-sets/extensions before expensive exact distance evaluation, not to certify code
-distances.
+small CNN-style feature extractor (fixed 3x3 convolution filters, support-mask,
+row/column, and pairwise-geometry summaries) followed by standardized ridge
+regression.  It is meant to rank candidate support sets/extensions before
+expensive exact distance evaluation, not to certify code distances.
 
 Examples
 --------
@@ -30,6 +30,7 @@ import json
 import math
 import random
 import sys
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -188,12 +189,11 @@ def _conv_valid(mask: np.ndarray, filt: np.ndarray) -> np.ndarray:
     return out
 
 
-def cnn_features(masks: np.ndarray) -> np.ndarray:
-    """Return fixed CNN-style features for an array shaped (n, 7, 7)."""
+def _basic_cnn_features(masks: np.ndarray) -> np.ndarray:
+    """Original compact feature extractor, kept for loading older .npz models."""
     rows: list[list[float]] = []
     coords = np.arange(GRID, dtype=np.float32)
     rr, cc = np.meshgrid(coords, coords, indexing="ij")
-
     for mask in masks.astype(np.float32, copy=False):
         feats: list[float] = [1.0, float(mask.sum())]
         mass = max(float(mask.sum()), 1.0)
@@ -211,15 +211,116 @@ def cnn_features(masks: np.ndarray) -> np.ndarray:
     return np.asarray(rows, dtype=np.float64)
 
 
+def cnn_features(masks: np.ndarray) -> np.ndarray:
+    """Return fixed CNN-style features for an array shaped (n, 7, 7).
+
+    The first prototype used only a handful of global pooled convolution
+    statistics.  On small exact-labeled datasets those features mostly recover
+    support size ``k`` and ridge regression can collapse toward per-k/overall
+    label means.  Keep the lightweight NumPy path, but expose more signal:
+    local convolution summaries, row/column occupancy, raw support-mask pixels,
+    and pairwise toroidal geometry histograms.
+    """
+    rows: list[list[float]] = []
+    coords = np.arange(GRID, dtype=np.float32)
+    rr, cc = np.meshgrid(coords, coords, indexing="ij")
+
+    for mask in masks.astype(np.float32, copy=False):
+        k = float(mask.sum())
+        mass = max(k, 1.0)
+        feats: list[float] = [1.0, k]
+        feats.extend(
+            [
+                float((mask * rr).sum() / mass),
+                float((mask * cc).sum() / mass),
+                float(mask[0].sum() + mask[-1].sum() + mask[:, 0].sum() + mask[:, -1].sum()),
+            ]
+        )
+
+        # Fixed 3x3 convolutional responses with global pooling.
+        for filt in FILTERS:
+            act = np.maximum(_conv_valid(mask, filt), 0.0)
+            feats.extend([float(act.mean()), float(act.max()), float(act.sum())])
+
+        # Marginal occupancy features.  Include both density and non-empty flags
+        # so the linear model can distinguish compact vs spread supports.
+        row_counts = mask.sum(axis=1)
+        col_counts = mask.sum(axis=0)
+        feats.extend((row_counts / mass).astype(float).tolist())
+        feats.extend((col_counts / mass).astype(float).tolist())
+        feats.extend((row_counts > 0).astype(float).tolist())
+        feats.extend((col_counts > 0).astype(float).tolist())
+
+        # Raw pixels are a cheap capacity boost for the tiny 7x7 domain.  Ridge
+        # regularization plus feature standardization keeps this from becoming
+        # an unregularized memorizer when datasets are small.
+        feats.extend(mask.reshape(-1).astype(float).tolist())
+
+        pts = np.argwhere(mask > 0.5)
+        pair_count = len(pts) * (len(pts) - 1) // 2
+        hist = np.zeros((4, 4), dtype=np.float64)
+        manhattan: list[float] = []
+        chebyshev: list[float] = []
+        euclidean: list[float] = []
+        same_row = same_col = same_diag = adjacent = close = 0
+        for i in range(len(pts)):
+            r1, c1 = (int(pts[i, 0]), int(pts[i, 1]))
+            for j in range(i + 1, len(pts)):
+                r2, c2 = (int(pts[j, 0]), int(pts[j, 1]))
+                dr_raw = abs(r1 - r2)
+                dc_raw = abs(c1 - c2)
+                dr = min(dr_raw, GRID - dr_raw)
+                dc = min(dc_raw, GRID - dc_raw)
+                hist[dr, dc] += 1.0
+                man = float(dr + dc)
+                cheb = float(max(dr, dc))
+                euc = float(math.sqrt(dr * dr + dc * dc))
+                manhattan.append(man)
+                chebyshev.append(cheb)
+                euclidean.append(euc)
+                same_row += int(dr == 0)
+                same_col += int(dc == 0)
+                same_diag += int(dr == dc)
+                adjacent += int(man == 1.0)
+                close += int(man <= 2.0)
+        denom = float(max(pair_count, 1))
+        feats.extend((hist.reshape(-1) / denom).tolist())
+        for values in (manhattan, chebyshev, euclidean):
+            if values:
+                arr = np.asarray(values, dtype=np.float64)
+                feats.extend([float(arr.mean()), float(arr.std()), float(arr.min()), float(arr.max())])
+            else:
+                feats.extend([0.0, 0.0, 0.0, 0.0])
+        feats.extend([same_row / denom, same_col / denom, same_diag / denom, adjacent / denom, close / denom])
+
+        rows.append(feats)
+    return np.asarray(rows, dtype=np.float64)
+
+
 @dataclass
 class RidgeCnnEstimator:
     weights: np.ndarray
     target_mean: float
     target_std: float
     ridge: float
+    x_mean: np.ndarray | None = None
+    x_std: np.ndarray | None = None
+
+    def _transform_features(self, X: np.ndarray) -> np.ndarray:
+        if self.x_mean is None or self.x_std is None:
+            return X
+        if len(self.x_mean) != X.shape[1] or len(self.x_std) != X.shape[1]:
+            return X
+        return (X - self.x_mean) / self.x_std
 
     def predict_masks(self, masks: np.ndarray) -> np.ndarray:
         X = cnn_features(masks)
+        if X.shape[1] != self.weights.shape[0]:
+            # Backward compatibility for models saved by the first prototype.
+            X = _basic_cnn_features(masks)
+        X = self._transform_features(X)
+        if X.shape[1] != self.weights.shape[0]:
+            raise ValueError(f"model expects {self.weights.shape[0]} features, got {X.shape[1]}")
         y_scaled = X @ self.weights
         return y_scaled * self.target_std + self.target_mean
 
@@ -228,39 +329,126 @@ class RidgeCnnEstimator:
         return self.predict_masks(masks)
 
     def save(self, path: Path) -> None:
-        np.savez(path, weights=self.weights, target_mean=self.target_mean, target_std=self.target_std, ridge=self.ridge)
+        np.savez(
+            path,
+            weights=self.weights,
+            target_mean=self.target_mean,
+            target_std=self.target_std,
+            ridge=self.ridge,
+            x_mean=self.x_mean if self.x_mean is not None else np.array([], dtype=np.float64),
+            x_std=self.x_std if self.x_std is not None else np.array([], dtype=np.float64),
+        )
 
     @classmethod
     def load(cls, path: Path) -> "RidgeCnnEstimator":
         data = np.load(path)
+        x_mean = data["x_mean"] if "x_mean" in data.files and data["x_mean"].size else None
+        x_std = data["x_std"] if "x_std" in data.files and data["x_std"].size else None
         return cls(
             weights=data["weights"],
             target_mean=float(data["target_mean"]),
             target_std=float(data["target_std"]),
             ridge=float(data["ridge"]),
+            x_mean=x_mean,
+            x_std=x_std,
         )
 
 
-def train_estimator(examples: Sequence[Example], ridge: float = 1e-2) -> RidgeCnnEstimator:
+def _example_balance_weights(examples: Sequence[Example], balance_by: str) -> np.ndarray | None:
+    if balance_by == "none":
+        return None
+    if balance_by == "k":
+        keys = [len(ex.indices) for ex in examples]
+    elif balance_by == "target":
+        keys = [round(float(ex.target), 8) for ex in examples]
+    elif balance_by == "k-target":
+        keys = [(len(ex.indices), round(float(ex.target), 8)) for ex in examples]
+    else:
+        raise ValueError(f"unknown balance mode {balance_by!r}")
+    counts = Counter(keys)
+    weights = np.asarray([1.0 / counts[key] for key in keys], dtype=np.float64)
+    return weights / float(weights.mean())
+
+
+def train_estimator(examples: Sequence[Example], ridge: float = 1e-2, balance_by: str = "none") -> RidgeCnnEstimator:
     if not examples:
         raise ValueError("no training examples found")
     masks = np.stack([mask_from_indices(ex.indices) for ex in examples])
     y = np.asarray([ex.target for ex in examples], dtype=np.float64)
-    X = cnn_features(masks)
-    target_mean = float(y.mean())
-    target_std = float(y.std() or 1.0)
-    y_scaled = (y - target_mean) / target_std
+    X_raw = cnn_features(masks)
+
+    # Standardize all non-bias columns before ridge regression.  Without this,
+    # large-scale count/sum features dominate the penalty and the model often
+    # behaves like a low-capacity predictor of the global/per-k mean.
+    x_mean = X_raw.mean(axis=0)
+    x_std = X_raw.std(axis=0)
+    x_mean[0] = 0.0
+    x_std[0] = 1.0
+    x_std[x_std == 0.0] = 1.0
+    X = (X_raw - x_mean) / x_std
+
+    sample_weight = _example_balance_weights(examples, balance_by)
+    if sample_weight is None:
+        target_mean = float(y.mean())
+        target_std = float(y.std() or 1.0)
+        y_scaled = (y - target_mean) / target_std
+        X_fit = X
+        y_fit = y_scaled
+    else:
+        wsum = float(sample_weight.sum())
+        target_mean = float(np.sum(sample_weight * y) / wsum)
+        target_std = float(math.sqrt(np.sum(sample_weight * (y - target_mean) ** 2) / wsum) or 1.0)
+        y_scaled = (y - target_mean) / target_std
+        scale = np.sqrt(sample_weight)
+        X_fit = X * scale[:, None]
+        y_fit = y_scaled * scale
+
     reg = ridge * np.eye(X.shape[1], dtype=np.float64)
     reg[0, 0] = 0.0  # do not penalize bias
-    weights = np.linalg.solve(X.T @ X + reg, X.T @ y_scaled)
-    return RidgeCnnEstimator(weights=weights, target_mean=target_mean, target_std=target_std, ridge=ridge)
+    weights = np.linalg.solve(X_fit.T @ X_fit + reg, X_fit.T @ y_fit)
+    return RidgeCnnEstimator(
+        weights=weights,
+        target_mean=target_mean,
+        target_std=target_std,
+        ridge=ridge,
+        x_mean=x_mean,
+        x_std=x_std,
+    )
 
 
-def train_validation_split(examples: Sequence[Example], val_fraction: float, seed: int) -> tuple[list[Example], list[Example]]:
+def train_validation_split(
+    examples: Sequence[Example],
+    val_fraction: float,
+    seed: int,
+    stratify: bool = True,
+) -> tuple[list[Example], list[Example]]:
     items = list(examples)
-    random.Random(seed).shuffle(items)
-    n_val = max(1, int(round(len(items) * val_fraction))) if len(items) > 1 else 0
-    return items[n_val:], items[:n_val]
+    rng = random.Random(seed)
+    if not stratify:
+        rng.shuffle(items)
+        n_val = max(1, int(round(len(items) * val_fraction))) if len(items) > 1 else 0
+        return items[n_val:], items[:n_val]
+
+    grouped: dict[tuple[int, float], list[Example]] = defaultdict(list)
+    for ex in items:
+        grouped[(len(ex.indices), round(float(ex.target), 8))].append(ex)
+
+    train: list[Example] = []
+    val: list[Example] = []
+    for group in grouped.values():
+        rng.shuffle(group)
+        if len(group) <= 1:
+            train.extend(group)
+            continue
+        n_val = max(1, int(round(len(group) * val_fraction)))
+        n_val = min(n_val, len(group) - 1)
+        val.extend(group[:n_val])
+        train.extend(group[n_val:])
+    rng.shuffle(train)
+    rng.shuffle(val)
+    if not val and len(items) > 1:
+        return train_validation_split(items, val_fraction, seed, stratify=False)
+    return train, val
 
 
 def evaluate(estimator: RidgeCnnEstimator, examples: Sequence[Example]) -> dict[str, float]:
@@ -309,8 +497,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model-out", type=Path, default=Path("support_point_cnn_model.npz"))
     parser.add_argument("--model-in", type=Path, help="load an existing .npz model instead of training")
     parser.add_argument("--ridge", type=float, default=1e-2)
+    parser.add_argument(
+        "--balance-by",
+        choices=["none", "k", "target", "k-target"],
+        default="none",
+        help="optional inverse-frequency weighting for ridge training",
+    )
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--no-stratify-split", action="store_true", help="use a plain random validation split")
     parser.add_argument("--smoke-test", action="store_true", help="use synthetic data so the workflow can be validated without search output")
     parser.add_argument("--smoke-count", type=int, default=96)
     parser.add_argument("--epochs", type=int, default=1, help="accepted for compatibility; ridge fit is closed-form")
@@ -331,8 +526,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             examples = load_examples(args.data, target_field=args.target_field)
         if not examples:
             raise SystemExit("No usable examples found (need indices plus min_distance/max_zeros).")
-        train, val = train_validation_split(examples, args.val_fraction, args.seed)
-        estimator = train_estimator(train, ridge=args.ridge)
+        train, val = train_validation_split(examples, args.val_fraction, args.seed, stratify=not args.no_stratify_split)
+        estimator = train_estimator(train, ridge=args.ridge, balance_by=args.balance_by)
         estimator.save(args.model_out)
         train_metrics = evaluate(estimator, train)
         val_metrics = evaluate(estimator, val)

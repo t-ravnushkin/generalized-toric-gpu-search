@@ -11,9 +11,10 @@ keep validating selected supports with the exact OpenCL/CUDA distance oracle.
 ## Dependencies
 
 No new required dependency is needed beyond the existing project `requirements.txt`.
-The prototype uses NumPy only.  It implements fixed 3x3 convolutional features on
-the 7x7 support mask and a closed-form ridge-regression head, so it runs on CPU
-without PyTorch/TensorFlow.
+The prototype uses NumPy only.  It implements fixed 3x3 convolutional summaries,
+row/column occupancy, raw 7x7 mask pixels, pairwise support-geometry features,
+and a standardized closed-form ridge-regression head, so it runs on CPU without
+PyTorch/TensorFlow.
 
 Generated `.npz` model files are local artifacts and can be safely deleted.
 
@@ -31,7 +32,23 @@ python support_point_cnn_estimator.py --smoke-test --epochs 1 \
 python support_point_cnn_estimator.py \
   --data 'canon_20260608_125209(1).json' canon_local_20260608_171130.json \
   --model-out support_point_cnn_model.npz
+
+# Optional for imbalanced exact-labeled datasets:
+python support_point_cnn_estimator.py \
+  --data cnnruns/support_point_cuda_bp_labeled.jsonl \
+  --balance-by k-target \
+  --model-out support_point_cnn_model.npz
 ```
+
+## Avoiding constant/per-k-mean predictors
+
+Small exact CUDA datasets can have very discrete labels: in the copied 256-row
+Kaggle run, support size explained much of the target and many `(k, distance)`
+buckets were rare.  The current workflow therefore uses a stratified validation
+split by `(k, min_distance)` where possible, standardized features, and optional
+inverse-frequency weighting (`--balance-by k`, `target`, or `k-target`).  Always
+inspect label counts by `k` and prediction standard deviation before trusting a
+ranking run; CNN predictions are heuristic triage scores only.
 
 ## Rank extensions with a saved model
 
