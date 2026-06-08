@@ -44,6 +44,27 @@ __constant__ int GF8_MUL[64] = {
     0,4,3,7,6,2,5,1,  0,5,1,4,2,7,3,6,  0,6,7,1,5,3,2,4,  0,7,5,2,1,6,4,3
 };
 
+__device__ __forceinline__ unsigned long long splitmix64(unsigned long long x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+__device__ __forceinline__ int sampled_coeff(
+    unsigned long long work_id,
+    int set_id,
+    int coeff_idx,
+    unsigned long long sample_seed
+) {
+    unsigned long long x =
+        sample_seed ^
+        ((unsigned long long)set_id * 0x9E3779B97F4A7C15ULL) ^
+        (work_id * 0xBF58476D1CE4E5B9ULL) ^
+        ((unsigned long long)(coeff_idx + 1) * 0x94D049BB133111EBULL);
+    return (int)(splitmix64(x) & 7ULL);
+}
+
 /* Build BITPAT cooperatively.
    bitpat must point to 3*k*8 uint64 words in shared memory.
    Call __syncthreads() after this returns. */
@@ -108,13 +129,13 @@ extern "C" __global__ void eval_min_distance_single_bp(
 /* ── Kernel 2-bp: batched BFS, one block per set, bit-parallel ───────────
    Grid  = num_sets
    Block = 256
-   Smem  = s_cache (64 B) + bitpat (192k B) + block_max + abort (8 B)
+   Smem  = s_cache (4k B, 8-byte aligned) + bitpat (192k B) +
+           block_max + abort (8 B)
 
    Dynamic shared memory layout:
-     [0  .. 63]            s_cache   — 16 int32 (room for k ≤ 16 indices)
-     [64 .. 64+192k-1]     bitpat    — 3*k*8 uint64  (64-byte offset ensures
-                                        8-byte alignment of uint64 array)
-     [64+192k .. +7]       block_max, abort_flag — 2 int32
+     [0  .. s_bytes-1]            s_cache   — k int32
+     [s_bytes .. s_bytes+192k-1]  bitpat    — 3*k*8 uint64
+     [s_bytes+192k .. +7]         block_max, abort_flag — 2 int32
 
    Polynomial evaluation collapses to:
      for i in 0..k-1:  v0 ^= bitpat[0][i][c[i]]
@@ -134,8 +155,9 @@ extern "C" __global__ void eval_min_distance_batch_bp(
     if (set_id >= num_sets) return;
 
     extern __shared__ char smem_raw[];
+    int s_bytes = ((k * (int)sizeof(int) + 7) & ~7);
     int*                s_cache    = (int*)smem_raw;
-    unsigned long long* bitpat     = (unsigned long long*)(smem_raw + 64);
+    unsigned long long* bitpat     = (unsigned long long*)(smem_raw + s_bytes);
     volatile int*       block_max  = (volatile int*)(bitpat + 3 * k * 8);
     volatile int*       abort_flag = block_max + 1;
 
@@ -150,33 +172,51 @@ extern "C" __global__ void eval_min_distance_batch_bp(
     __syncthreads();
 
     const unsigned long long TORUS_MASK = (1ULL << 49) - 1;
-    long long total_polys = (1LL << (3 * k)) - 1;
-    long long work_items = sample_count > 0 ? sample_count : total_polys;
+    unsigned long long total_polys =
+        (3 * k <= 63)
+            ? ((1ULL << (3 * k)) - 1ULL)
+            : 0xffffffffffffffffULL;
+    unsigned long long work_items =
+        sample_count > 0
+            ? (unsigned long long)sample_count
+            : total_polys;
+    bool use_poly_id_sampling = (sample_count > 0 && 3 * k <= 63);
     int thread_max  = 0;
 
-    for (long long work_id = (long long)threadIdx.x + 1;
+    for (unsigned long long work_id = (unsigned long long)threadIdx.x + 1ULL;
          work_id <= work_items;
-         work_id += blockDim.x)
+         work_id += (unsigned long long)blockDim.x)
     {
         if (*abort_flag) break;
 
-        long long poly_id = work_id;
-        if (sample_count > 0) {
+        unsigned long long poly_id = work_id;
+        if (use_poly_id_sampling) {
             unsigned long long x =
                 sample_seed ^
                 ((unsigned long long)set_id * 0x9E3779B97F4A7C15ULL) ^
                 ((unsigned long long)work_id * 0xBF58476D1CE4E5B9ULL);
-            x += 0x9E3779B97F4A7C15ULL;
-            x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-            x = x ^ (x >> 31);
-            poly_id = (long long)(x % (unsigned long long)total_polys) + 1LL;
+            poly_id = (splitmix64(x) % total_polys) + 1ULL;
         }
 
         unsigned long long v0 = 0, v1 = 0, v2 = 0;
-        long long tmp = poly_id;
+        unsigned long long tmp = poly_id;
+        int forced_idx = 0;
+        if (sample_count > 0 && !use_poly_id_sampling) {
+            unsigned long long x =
+                sample_seed ^
+                ((unsigned long long)set_id * 0xD6E8FEB86659FD93ULL) ^
+                (work_id * 0xA5A3564E27F8861FULL);
+            forced_idx = (int)(splitmix64(x) % (unsigned long long)k);
+        }
+
         for (int i = 0; i < k; i++) {
-            int c = tmp & 7; tmp >>= 3;
+            int c;
+            if (sample_count > 0 && !use_poly_id_sampling) {
+                c = sampled_coeff(work_id, set_id, i, sample_seed);
+                if (i == forced_idx && c == 0) c = 1;
+            } else {
+                c = tmp & 7; tmp >>= 3;
+            }
             v0 ^= bitpat[          i * 8 + c];
             v1 ^= bitpat[    k * 8 + i * 8 + c];
             v2 ^= bitpat[2 * k * 8 + i * 8 + c];
@@ -220,12 +260,15 @@ class DistanceOracleCUDABP:
         return 3 * k * 8 * 8          # 3*k*8 uint64
 
     def _batch_smem(self, k: int) -> int:
-        return 64 + 3 * k * 8 * 8 + 8  # s_cache + bitpat + block_max + abort
+        s_bytes = ((k * 4 + 7) // 8) * 8
+        return s_bytes + 3 * k * 8 * 8 + 8
 
     def max_zeros(self, s_indices: list[int], target_distance: int) -> int:
         k = len(s_indices)
         if k == 0:
             return 0
+        if k > 21:
+            raise ValueError("Exact CUDA-BP evaluation supports k <= 21")
         tmax_zeros  = 49 - target_distance
         total_polys = (8 ** k) - 1
 
@@ -255,6 +298,10 @@ class DistanceOracleCUDABP:
         if num_sets == 0:
             return []
         k          = len(batched_indices[0])
+        if k > 49:
+            raise ValueError("CUDA-BP bit-parallel kernel supports k <= 49")
+        if sample_count <= 0 and k > 21:
+            raise ValueError("Exact CUDA-BP batch evaluation supports k <= 21")
         tmax_zeros = 49 - target_distance
 
         flat = np.array(

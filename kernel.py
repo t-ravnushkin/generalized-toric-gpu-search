@@ -7,6 +7,27 @@ __constant int GF8_MUL[64] = {
     0,4,3,7,6,2,5,1,  0,5,1,4,2,7,3,6,  0,6,7,1,5,3,2,4,  0,7,5,2,1,6,4,3
 };
 
+inline ulong splitmix64(ulong x) {
+    x += 0x9E3779B97F4A7C15UL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
+    return x ^ (x >> 31);
+}
+
+inline int sampled_coeff(
+    ulong work_id,
+    int set_id,
+    int coeff_idx,
+    ulong sample_seed
+) {
+    ulong x =
+        sample_seed ^
+        ((ulong)set_id * 0x9E3779B97F4A7C15UL) ^
+        (work_id * 0xBF58476D1CE4E5B9UL) ^
+        ((ulong)(coeff_idx + 1) * 0x94D049BB133111EBUL);
+    return (int)(splitmix64(x) & 7UL);
+}
+
 /* Build bit-plane masks for the current set:
    bitpat[b][i][v] is a 49-bit mask whose j-th bit is the b-th output bit of
    GF8_MUL[v * M[s[i], j]].  This turns each polynomial evaluation into
@@ -47,7 +68,7 @@ __kernel void eval_min_distance(
 ) {
     int poly_id = (int)get_global_id(0) + 1; 
 
-    int coeffs[16];
+    int coeffs[49];
     int tmp = poly_id;
     for (int i = 0; i < k; i++) {
         coeffs[i] = tmp & 7;
@@ -78,6 +99,8 @@ __kernel void eval_min_distance_batch_bp(
     __global const int* batched_s_idx,
     int k, int tmax_zeros,
     int num_sets,
+    long sample_count,
+    ulong sample_seed,
     __local ulong* bitpat,
     __local int* scratch,
     __global int* out
@@ -89,7 +112,7 @@ __kernel void eval_min_distance_batch_bp(
 
     int base_idx = set_id * k;
 
-    __local int local_s[16];
+    __local int local_s[49];
     __local volatile int abort_flag;
 
     if (lid < k)
@@ -102,20 +125,53 @@ __kernel void eval_min_distance_batch_bp(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     const ulong TORUS_MASK = (1UL << 49) - 1UL;
-    long total_polys = (1L << (3 * k)) - 1L;
+    ulong total_polys =
+        (3 * k <= 63)
+            ? ((1UL << (3 * k)) - 1UL)
+            : 0xffffffffffffffffUL;
+    ulong work_items =
+        (sample_count > 0)
+            ? (ulong)sample_count
+            : total_polys;
+    int use_poly_id_sampling = (sample_count > 0 && 3 * k <= 63);
 
     int thread_max = 0;
-    for (long poly_id = (long)lid + 1L;
-         poly_id <= total_polys;
-         poly_id += (long)lsz)
+    for (ulong work_id = (ulong)lid + 1UL;
+         work_id <= work_items;
+         work_id += (ulong)lsz)
     {
         if (abort_flag) break;
 
         ulong v0 = 0UL, v1 = 0UL, v2 = 0UL;
-        long tmp = poly_id;
+        ulong poly_id = work_id;
+        if (use_poly_id_sampling) {
+            ulong x =
+                sample_seed ^
+                ((ulong)set_id * 0x9E3779B97F4A7C15UL) ^
+                (work_id * 0xBF58476D1CE4E5B9UL);
+            poly_id = (splitmix64(x) % total_polys) + 1UL;
+        }
+
+        ulong tmp = poly_id;
+        int forced_idx = 0;
+        if (sample_count > 0 && !use_poly_id_sampling) {
+            ulong x =
+                sample_seed ^
+                ((ulong)set_id * 0xD6E8FEB86659FD93UL) ^
+                (work_id * 0xA5A3564E27F8861FUL);
+            forced_idx = (int)(splitmix64(x) % (ulong)k);
+        }
+
         for (int i = 0; i < k; i++) {
-            int c = (int)(tmp & 7L);
-            tmp >>= 3;
+            int c;
+            if (sample_count > 0 && !use_poly_id_sampling) {
+                c = sampled_coeff(work_id, set_id, i, sample_seed);
+                if (i == forced_idx && c == 0)
+                    c = 1;
+            } else {
+                c = (int)(tmp & 7UL);
+                tmp >>= 3;
+            }
             v0 ^= bitpat[          i * 8 + c];
             v1 ^= bitpat[    k * 8 + i * 8 + c];
             v2 ^= bitpat[2 * k * 8 + i * 8 + c];
@@ -187,6 +243,8 @@ class DistanceOracle:
         k = len(s_indices)
         if k == 0:
             return 0
+        if k > 21:
+            raise ValueError("Exact OpenCL evaluation supports k <= 21")
         tmax_zeros = 49 - target_distance
         total_polys = (8**k) - 1
 
@@ -216,15 +274,21 @@ class DistanceOracle:
         return int(out_np[0])
 
     def max_zeros_batch(
-        self, batched_indices: list[list[int]], target_distance: int
+        self,
+        batched_indices: list[list[int]],
+        target_distance: int,
+        sample_count: int = 0,
+        sample_seed: int = 0,
     ) -> list[int]:
         """High-performance batched BFS evaluation (one work-group per set)."""
         num_sets = len(batched_indices)
         if num_sets == 0:
             return []
         k = len(batched_indices[0])
-        if k > 16:
-            raise ValueError("OpenCL bit-parallel kernel supports k <= 16")
+        if k > 49:
+            raise ValueError("OpenCL bit-parallel kernel supports k <= 49")
+        if sample_count <= 0 and k > 21:
+            raise ValueError("Exact OpenCL batch evaluation supports k <= 21")
         tmax_zeros = 49 - target_distance
 
         flat_indices = np.array(
@@ -248,6 +312,8 @@ class DistanceOracle:
             np.int32(k),
             np.int32(tmax_zeros),
             np.int32(num_sets),
+            np.int64(sample_count),
+            np.uint64(sample_seed),
             cl.LocalMemory(3 * k * 8 * 8),
             cl.LocalMemory(self._wg_size * 4),
             out_buf,
