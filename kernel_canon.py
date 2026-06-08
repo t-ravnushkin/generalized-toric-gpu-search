@@ -75,10 +75,15 @@ extern "C" __global__ void canonical_forms(
                 t[j] = tmp;
             }
 
-            /* Pack: 6 bits per sorted index, positions 0..k-1. */
+            /* Pack into uint64.
+               k≤10: positions 0..k-1  (t[0]=0 explicit) — 10×6=60 bits max.
+               k=11: skip position 0 (always 0 after translate+sort),
+                     pack positions 1..10 — 10×6=60 bits, no overflow.
+               Both cases fit; k≤10 format is unchanged for checkpoint compat. */
             unsigned long long packed = 0;
-            for (int i = 0; i < k; i++)
-                packed |= (unsigned long long)t[i] << (6 * i);
+            int pack_from = (k <= 10) ? 0 : 1;
+            for (int i = pack_from; i < k; i++)
+                packed |= (unsigned long long)t[i] << (6 * (i - pack_from));
 
             if (packed < best) best = packed;
         }
@@ -115,8 +120,9 @@ class CanonicalOracle:
     def compute(self, sets: np.ndarray) -> np.ndarray:
         """
         sets : (n, k) int32, rows sorted ascending.
-        Returns (n,) uint64 canonical packed values  (6 bits per index).
-        Requires k ≤ 10 so k×6 ≤ 60 bits fits in uint64.
+        Returns (n,) uint64 canonical packed values.
+        k≤10: 6 bits per index, positions 0..k-1.
+        k=11: positions 1..10 only (position 0 is always 0); 10×6=60 bits.
         """
         n, k = sets.shape
         threads = self._THREADS
