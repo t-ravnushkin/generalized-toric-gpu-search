@@ -41,6 +41,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from itertools import product
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -80,8 +82,35 @@ def _gl2() -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Canonical form — vectorised batch version
+# Relative-position table  (49×49, fits in L1 cache)
 # ---------------------------------------------------------------------------
+# rel_table[a, b] = index of (point_b − point_a) mod 7 in F₇².
+# Replaces the 5-op chain  (tr//7, tr%7, subtract, %7, *7+)  with one lookup.
+
+_REL_TABLE: np.ndarray | None = None
+
+
+def _rel_table() -> np.ndarray:
+    global _REL_TABLE
+    if _REL_TABLE is None:
+        pts_a = np.arange(49, dtype=np.int32) // 7
+        pts_b = np.arange(49, dtype=np.int32) % 7
+        _REL_TABLE = (
+            (pts_a[None, :] - pts_a[:, None]) % 7 * 7 +
+            (pts_b[None, :] - pts_b[:, None]) % 7
+        ).astype(np.uint8)   # (49, 49), values 0–48
+    return _REL_TABLE
+
+
+# ---------------------------------------------------------------------------
+# Canonical form — perm-chunked vectorised batch version
+# ---------------------------------------------------------------------------
+# Old code: 2016 Python loop iterations × k anchor iterations, each on (n,k).
+# New code: ⌈2016/P⌉ × k iterations on (P,n,k) — ~30× fewer Python calls.
+# Perm chunk P is tuned to keep working set ≤ ~256 MB.
+
+_PERM_CHUNK = 64   # GL₂ permutations processed per numpy call
+
 
 def canonical_forms_batch(
     sets_arr: np.ndarray,   # (n, k)  int32, each row sorted
@@ -99,27 +128,23 @@ def canonical_forms_batch(
     Returns uint64 array of shape (n,).
     """
     n, k = sets_arr.shape
-    shifts = np.arange(k, dtype=np.uint64) * 6     # 6 bits per index (max 48 < 64)
+    rt   = _rel_table()    # (49, 49) uint8 — L1-resident after first call
     best = np.full(n, np.iinfo(np.uint64).max, dtype=np.uint64)
 
-    for perm in gl2_perms:
-        transformed = perm[sets_arr]                         # (n, k)
-
-        # Must try ALL k translation anchors (putting each point at origin),
-        # not just the lex-min point.  A non-minimum anchor can yield a
-        # lex-smaller sorted tuple when other points wrap around mod 7.
-        ta = (transformed // 7).astype(np.int32)             # (n, k)
-        tb = (transformed %  7).astype(np.int32)
+    for pi in range(0, len(gl2_perms), _PERM_CHUNK):
+        pc = gl2_perms[pi: pi + _PERM_CHUNK]   # (P, 49)
+        tr = pc[:, sets_arr]                     # (P, n, k) int32
 
         for t in range(k):
-            anc_a = ta[:, t]                                 # (n,)
-            anc_b = tb[:, t]
-            sa = (ta - anc_a[:, None]) % 7                  # (n, k)
-            sb = (tb - anc_b[:, None]) % 7
-            shifted = (sa * 7 + sb).astype(np.uint64)
-            shifted = np.sort(shifted, axis=1)
-            packed = (shifted << shifts[None, :]).sum(axis=1)
-            np.minimum(best, packed, out=best)
+            # One table lookup replaces: tr//7, tr%7, subtract, %7, *7+
+            idx = rt[tr[:, :, [t]], tr]          # (P, n, k) uint8, values 0–48
+            idx.sort(axis=2)
+            # Pack k 6-bit indices into one uint64 without materialising
+            # the full (P, n, k) uint64 array (avoids P*n*k*8 bytes).
+            packed = np.zeros((len(pc), n), dtype=np.uint64)
+            for j in range(k):
+                packed |= idx[:, :, j].astype(np.uint64) << np.uint64(6 * j)
+            np.minimum(best, packed.min(axis=0), out=best)
 
     return best
 
@@ -204,10 +229,103 @@ def _dispatch(oracles, batch: list[list[int]], td: int) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Main search
+# Pipelined CPU canonicalization + GPU evaluation
 # ---------------------------------------------------------------------------
 
-_CANON_CHUNK = 200_000   # sets per numpy canonicalization chunk
+_CANON_CHUNK = 200_000   # sets per CPU canonicalization chunk
+
+
+def _pipelined_eval(
+    raw: list[tuple[int, ...]],
+    use_canonical: bool,
+    gl2: np.ndarray,
+    k: int,
+    td: int,
+    batch_size: int,
+    oracles: list,
+) -> tuple[list[int], list[tuple[int, ...]], list[int]]:
+    """
+    Overlap canonical-form computation (CPU) with GPU evaluation.
+
+    Producer thread: iterates raw chunks, packs/canonicalizes them,
+    deduplicates via seen_packed, and enqueues GPU-sized batches.
+
+    Consumer thread: dequeues each batch and dispatches it to the GPU
+    immediately, without waiting for the rest of canonicalization to finish.
+
+    Queue maxsize caps how far ahead the CPU can run, keeping memory bounded
+    and back-pressuring the producer when the GPU is the bottleneck.
+    """
+    # allow CPU to be at most this many batches ahead of GPU
+    q: Queue = Queue(maxsize=max(2, len(oracles)))
+
+    packed_out:  list[int]             = []
+    indices_out: list[tuple[int, ...]] = []
+    mz_out:      list[int]             = []
+
+    def _producer() -> None:
+        seen: set[int] = set()
+        buf_p: list[int]             = []
+        buf_i: list[tuple[int, ...]] = []
+
+        for ci in range(0, len(raw), _CANON_CHUNK):
+            chunk = np.array(raw[ci: ci + _CANON_CHUNK], dtype=np.int32)
+            if use_canonical:
+                packed_arr = canonical_forms_batch(chunk, gl2)
+                packed_list = packed_arr.tolist()
+                index_list  = [unpack_canonical(p, k) for p in packed_list]
+            else:
+                # Use Python ints (arbitrary precision) to avoid uint64 overflow
+                # at k >= 11: 11 * 6 = 66 bits > 64. Use chunk rows directly as
+                # indices — no unpack needed since no GL2 reduction is applied.
+                chunk_list  = chunk.tolist()
+                packed_list = [
+                    sum(v << (6 * j) for j, v in enumerate(row))
+                    for row in chunk_list
+                ]
+                index_list  = [tuple(row) for row in chunk_list]
+
+            for p, idx in zip(packed_list, index_list):
+                if p not in seen:
+                    seen.add(p)
+                    buf_p.append(p)
+                    buf_i.append(idx)
+                    if len(buf_i) == batch_size:
+                        q.put((buf_p[:], buf_i[:]))
+                        buf_p.clear()
+                        buf_i.clear()
+
+        if buf_i:
+            q.put((buf_p, buf_i))
+        q.put(None)  # sentinel
+
+    def _consumer() -> None:
+        pbar = tqdm(unit=" sets", desc=f"k={k}", dynamic_ncols=True, leave=False)
+        while True:
+            item = q.get()
+            if item is None:
+                pbar.close()
+                return
+            bp, bi = item
+            mz = _dispatch(oracles, [list(s) for s in bi], td)
+            packed_out.extend(bp)
+            indices_out.extend(bi)
+            mz_out.extend(mz)
+            pbar.update(len(bi))
+
+    prod = Thread(target=_producer, daemon=True)
+    cons = Thread(target=_consumer, daemon=True)
+    prod.start()
+    cons.start()
+    prod.join()
+    cons.join()
+
+    return packed_out, indices_out, mz_out
+
+
+# ---------------------------------------------------------------------------
+# Main search
+# ---------------------------------------------------------------------------
 
 
 def canonical_champion_search(
@@ -263,63 +381,35 @@ def canonical_champion_search(
     for k in range(start_k + 1, max_k + 1):
         td = targets.get(k, 1)
 
-        # ── Expand: generate all canonical k-forms ────────────────────────
+        # ── Expand raw extensions ─────────────────────────────────────────
         t0 = time.perf_counter()
 
         prev_list: list[tuple[int, ...]] = [
             unpack_canonical(p, k - 1) for p in canonical_level
         ]
 
-        # Generate raw extensions (one extra point appended, then sorted)
         raw: list[tuple[int, ...]] = []
         for S in prev_list:
             s_set = set(S)
             for p in range(49):
                 if p not in s_set:
                     raw.append(tuple(sorted(S + (p,))))
+        raw = list(dict.fromkeys(raw))
 
-        # Deduplicate raw before the packing pass
-        raw = list(dict.fromkeys(raw))   # preserves order, removes dupes
-
-        # Pack in chunks.
-        # k ≤ k_canonical_max: full GL₂ canonical form (complete, CPU-heavy).
-        # k > k_canonical_max: direct sorted-tuple packing (O(1), GPU-bound).
+        # ── Pipeline: canonicalize chunks on CPU while GPU evaluates ──────
+        # Producer enqueues deduplicated batches as soon as each chunk is
+        # packed; consumer dispatches to GPU immediately without waiting for
+        # the full canonicalization pass to finish.
         use_canonical = (k <= k_canonical_max)
-        _shifts = np.arange(k, dtype=np.uint64) * 6   # shared by both paths
+        mode_label = "canonical forms" if use_canonical else "raw-BFS sets"
 
-        seen_packed:    set[int]             = set()
-        new_packed:     list[int]            = []
-        new_indices:    list[tuple[int,...]] = []
-
-        for ci in range(0, len(raw), _CANON_CHUNK):
-            chunk_arr = np.array(raw[ci: ci + _CANON_CHUNK], dtype=np.int32)
-            if use_canonical:
-                packed = canonical_forms_batch(chunk_arr, gl2)
-            else:
-                packed = (chunk_arr.astype(np.uint64) << _shifts).sum(axis=1)
-            for p_val in packed.tolist():
-                if p_val not in seen_packed:
-                    seen_packed.add(p_val)
-                    new_packed.append(p_val)
-                    new_indices.append(unpack_canonical(p_val, k))
+        new_packed, new_indices, all_mz = _pipelined_eval(
+            raw, use_canonical, gl2, k, td, batch_size, oracles
+        )
 
         n_cands = len(new_indices)
-        t_expand = time.perf_counter() - t0
-        mode_label = "canonical forms" if use_canonical else "raw-BFS sets"
-        print(f"  k={k}: {n_cands:,} {mode_label}  "
-              f"target_d={td}  expand={t_expand:.1f}s")
-
-        # ── Evaluate on GPU ───────────────────────────────────────────────
-        t0 = time.perf_counter()
-        all_mz: list[int] = []
-
-        for bi in tqdm(range(0, n_cands, batch_size),
-                       desc=f"k={k}", dynamic_ncols=True, leave=False):
-            chunk = [list(new_indices[j])
-                     for j in range(bi, min(bi + batch_size, n_cands))]
-            all_mz.extend(_dispatch(oracles, chunk, td))
-
-        t_eval = time.perf_counter() - t0
+        t_total = time.perf_counter() - t0
+        print(f"  k={k}: {n_cands:,} {mode_label}  target_d={td}  time={t_total:.1f}s")
 
         # ── Record champions and survivors ────────────────────────────────
         next_level: set[int] = set()
@@ -352,7 +442,7 @@ def canonical_champion_search(
                        "n_survivors": len(next_level)}, results_file)
 
         print(f"  k={k}: {n_champ} champions (d≥{td}), "
-              f"{len(next_level):,} survivors  eval={t_eval:.1f}s\n")
+              f"{len(next_level):,} survivors\n")
 
         if not next_level:
             print(f"  *** 0 survivors — BFS frontier exhausted at k={k} ***")
