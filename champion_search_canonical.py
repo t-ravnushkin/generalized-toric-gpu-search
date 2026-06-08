@@ -47,6 +47,12 @@ from threading import Thread
 import numpy as np
 from tqdm.auto import tqdm
 
+try:
+    from kernel_canon import init_canon_oracle
+    _HAS_GPU_CANON = True
+except Exception:
+    _HAS_GPU_CANON = False
+
 
 # ---------------------------------------------------------------------------
 # AGL₂(F₇) — precompute GL₂(F₇) as permutations of 49 lattice points
@@ -103,49 +109,28 @@ def _rel_table() -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Canonical form — perm-chunked vectorised batch version
+# Canonical form — CPU reference (kept for testing; pipeline uses GPU kernel)
 # ---------------------------------------------------------------------------
-# Old code: 2016 Python loop iterations × k anchor iterations, each on (n,k).
-# New code: ⌈2016/P⌉ × k iterations on (P,n,k) — ~30× fewer Python calls.
-# Perm chunk P is tuned to keep working set ≤ ~256 MB.
-
-_PERM_CHUNK = 64   # GL₂ permutations processed per numpy call
-
 
 def canonical_forms_batch(
     sets_arr: np.ndarray,   # (n, k)  int32, each row sorted
     gl2_perms: np.ndarray,  # (2016, 49)  int32
 ) -> np.ndarray:
-    """
-    Vectorised canonical form for n k-sets simultaneously.
-
-    Each canonical form is packed as a uint64:
-        packed = sum(sorted_idx[i] * 64**i,  i=0..k-1)
-    where sorted_idx is the sorted index tuple after applying the
-    best GL₂ image + translation-to-origin normalisation.
-
-    Unpack with unpack_canonical(packed, k).
-    Returns uint64 array of shape (n,).
-    """
+    """CPU fallback: vectorised canonical form for n k-sets. Returns uint64 (n,)."""
+    _CHUNK = 64
     n, k = sets_arr.shape
-    rt   = _rel_table()    # (49, 49) uint8 — L1-resident after first call
+    rt   = _rel_table()
     best = np.full(n, np.iinfo(np.uint64).max, dtype=np.uint64)
-
-    for pi in range(0, len(gl2_perms), _PERM_CHUNK):
-        pc = gl2_perms[pi: pi + _PERM_CHUNK]   # (P, 49)
-        tr = pc[:, sets_arr]                     # (P, n, k) int32
-
+    for pi in range(0, len(gl2_perms), _CHUNK):
+        pc = gl2_perms[pi: pi + _CHUNK]
+        tr = pc[:, sets_arr]
         for t in range(k):
-            # One table lookup replaces: tr//7, tr%7, subtract, %7, *7+
-            idx = rt[tr[:, :, [t]], tr]          # (P, n, k) uint8, values 0–48
+            idx = rt[tr[:, :, [t]], tr]
             idx.sort(axis=2)
-            # Pack k 6-bit indices into one uint64 without materialising
-            # the full (P, n, k) uint64 array (avoids P*n*k*8 bytes).
             packed = np.zeros((len(pc), n), dtype=np.uint64)
             for j in range(k):
                 packed |= idx[:, :, j].astype(np.uint64) << np.uint64(6 * j)
             np.minimum(best, packed.min(axis=0), out=best)
-
     return best
 
 
@@ -229,34 +214,30 @@ def _dispatch(oracles, batch: list[list[int]], td: int) -> list[int]:
 
 
 # ---------------------------------------------------------------------------
-# Pipelined CPU canonicalization + GPU evaluation
+# Pipelined GPU canonicalization + GPU evaluation
 # ---------------------------------------------------------------------------
 
-_CANON_CHUNK = 200_000   # sets per CPU canonicalization chunk
+_CANON_CHUNK = 200_000   # sets per canonicalization chunk
 
 
 def _pipelined_eval(
     raw: list[tuple[int, ...]],
-    use_canonical: bool,
-    gl2: np.ndarray,
+    canon_oracle,          # CanonicalOracle | None  (None → raw-BFS)
     k: int,
     td: int,
     batch_size: int,
     oracles: list,
 ) -> tuple[list[int], list[tuple[int, ...]], list[int]]:
     """
-    Overlap canonical-form computation (CPU) with GPU evaluation.
+    Overlap GPU canonical-form computation with GPU evaluation.
 
-    Producer thread: iterates raw chunks, packs/canonicalizes them,
-    deduplicates via seen_packed, and enqueues GPU-sized batches.
+    Producer: chunks raw tuples → GPU canonical kernel → CPU dedup → queue.
+    Consumer: dequeues batches → evaluation oracles → collects results.
 
-    Consumer thread: dequeues each batch and dispatches it to the GPU
-    immediately, without waiting for the rest of canonicalization to finish.
-
-    Queue maxsize caps how far ahead the CPU can run, keeping memory bounded
-    and back-pressuring the producer when the GPU is the bottleneck.
+    When canon_oracle is None (k > k_canonical_max), raw sorted-tuple
+    deduplication is used instead, with Python-int packing to avoid uint64
+    overflow at k ≥ 11 (11×6 = 66 > 64 bits).
     """
-    # allow CPU to be at most this many batches ahead of GPU
     q: Queue = Queue(maxsize=max(2, len(oracles)))
 
     packed_out:  list[int]             = []
@@ -270,22 +251,22 @@ def _pipelined_eval(
 
         for ci in range(0, len(raw), _CANON_CHUNK):
             chunk = np.array(raw[ci: ci + _CANON_CHUNK], dtype=np.int32)
-            if use_canonical:
-                packed_arr = canonical_forms_batch(chunk, gl2)
-                packed_list = packed_arr.tolist()
-                index_list  = [unpack_canonical(p, k) for p in packed_list]
+
+            if canon_oracle is not None:
+                # GPU: apply all 2016 GL₂ permutations × k anchors in parallel.
+                packed_arr  = canon_oracle.compute(chunk)   # (n,) uint64
+                packed_vals = packed_arr.tolist()
+                index_vals  = [unpack_canonical(p, k) for p in packed_vals]
             else:
-                # Use Python ints (arbitrary precision) to avoid uint64 overflow
-                # at k >= 11: 11 * 6 = 66 bits > 64. Use chunk rows directly as
-                # indices — no unpack needed since no GL2 reduction is applied.
+                # Raw-BFS: Python-int packing avoids uint64 overflow at k ≥ 11.
                 chunk_list  = chunk.tolist()
-                packed_list = [
+                packed_vals = [
                     sum(v << (6 * j) for j, v in enumerate(row))
                     for row in chunk_list
                 ]
-                index_list  = [tuple(row) for row in chunk_list]
+                index_vals = [tuple(row) for row in chunk_list]
 
-            for p, idx in zip(packed_list, index_list):
+            for p, idx in zip(packed_vals, index_vals):
                 if p not in seen:
                     seen.add(p)
                     buf_p.append(p)
@@ -337,38 +318,46 @@ def canonical_champion_search(
     batch_size: int = 50_000,
     prune_margin: int | None = None,
     resume: bool = True,
-    k_canonical_max: int = 9,
+    k_canonical_max: int = 10,
 ):
     """
-    Hybrid champion search: canonical forms for k ≤ k_canonical_max,
+    Hybrid champion search: GPU canonical forms for k ≤ k_canonical_max,
     raw sorted-tuple BFS for k > k_canonical_max.
 
-    For small k the AGL₂(F₇) orbit reduction (×98,784) makes canonicalization
-    worthwhile.  Above k_canonical_max the GL₂ loop over 2016 matrices becomes
-    the CPU bottleneck while the GPU sits idle; switching to raw-tuple
-    deduplication (O(1) numpy) keeps the GPU fully utilised at the cost of
-    evaluating AGL-equivalent sets multiple times.
+    Canonical forms exploit AGL₂(F₇) symmetry (order 98,784) so each orbit
+    is evaluated once.  The GPU kernel applies all 2016 GL₂ matrices × k
+    anchors in parallel (one warp per set), keeping the GPU busy at all k.
 
     k_canonical_max:
-      k ≤ this — full GL₂ canonical forms (complete, CPU-heavy at large k).
-      k > this — sorted-tuple deduplication only (GPU-bound, slight redundancy).
-      Default 9 matches the inflection point where canonical-form count jumps
-      from ~25K (k=9) to ~100K (k=10), making GL₂ cost dominant.
+      k ≤ this — GPU GL₂ canonical forms (complete, uint64 packing requires
+                 k×6 ≤ 60 bits, so max is 10).
+      k > this — raw sorted-tuple BFS; Python-int packing avoids uint64
+                 overflow at k ≥ 11.
+      Default 10 (extended from 9 once canonicalization moved to GPU).
 
     prune_margin:
       None  — keep ALL surviving k-forms for the next level.
       int   — prune sets with min_distance < targets[k] - prune_margin.
     """
-    gl2 = _gl2()
+    gl2    = _gl2()
     n_gpus = len(oracles) if hasattr(oracles, "__len__") else 1
     if not isinstance(oracles, list):
         oracles = [oracles]
 
+    # Initialise the GPU canonical-form kernel (compile once, reuse every level).
+    canon_oracle = None
+    if _HAS_GPU_CANON and k_canonical_max > 0:
+        canon_oracle = init_canon_oracle(
+            device_id = oracles[0].device_id,
+            gl2_perms = gl2,
+            rel_table = _rel_table(),
+        )
+
     print(f"\n=== Hybrid Champion Search  max_k={max_k}  gpus={n_gpus}  "
           f"k_canonical_max={k_canonical_max}  "
           f"prune={'none' if prune_margin is None else prune_margin} ===\n"
-          f"    canonical (AGL₂, complete) for k≤{k_canonical_max}; "
-          f"raw-BFS (GPU-bound) for k>{k_canonical_max}\n")
+          f"    GPU canonical (AGL₂) for k≤{k_canonical_max}; "
+          f"raw-BFS for k>{k_canonical_max}\n")
 
     # ── Resume support ────────────────────────────────────────────────────
     start_k, canonical_level = 1, {0}
@@ -396,15 +385,12 @@ def canonical_champion_search(
                     raw.append(tuple(sorted(S + (p,))))
         raw = list(dict.fromkeys(raw))
 
-        # ── Pipeline: canonicalize chunks on CPU while GPU evaluates ──────
-        # Producer enqueues deduplicated batches as soon as each chunk is
-        # packed; consumer dispatches to GPU immediately without waiting for
-        # the full canonicalization pass to finish.
-        use_canonical = (k <= k_canonical_max)
-        mode_label = "canonical forms" if use_canonical else "raw-BFS sets"
+        # ── Pipeline: GPU canonicalization interleaved with GPU evaluation ──
+        co         = canon_oracle if (k <= k_canonical_max) else None
+        mode_label = "canonical forms" if co is not None else "raw-BFS sets"
 
         new_packed, new_indices, all_mz = _pipelined_eval(
-            raw, use_canonical, gl2, k, td, batch_size, oracles
+            raw, co, k, td, batch_size, oracles
         )
 
         n_cands = len(new_indices)
@@ -487,7 +473,7 @@ def main() -> Path:
         batch_size      = bs,
         prune_margin    = None,
         resume          = True,
-        k_canonical_max = 9,
+        k_canonical_max = 10,
     )
     return results_file
 
