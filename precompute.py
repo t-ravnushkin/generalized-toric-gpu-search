@@ -43,11 +43,23 @@ def build_eval_matrix() -> np.ndarray:
     return M
 
 
+def _devices_for(
+    platform: cl.Platform,
+    device_type: int | None = None,
+) -> list[cl.Device]:
+    try:
+        if device_type is None:
+            return list(platform.get_devices())
+        return list(platform.get_devices(device_type=device_type))
+    except cl.LogicError:
+        return []
+
+
 def _all_gpu_devices() -> list[tuple[cl.Platform, cl.Device]]:
     return [
         (platform, device)
         for platform in cl.get_platforms()
-        for device in platform.get_devices(device_type=cl.device_type.GPU)
+        for device in _devices_for(platform, cl.device_type.GPU)
     ]
 
 
@@ -70,22 +82,35 @@ def init_opencl_all() -> tuple[list[tuple[cl.Context, cl.CommandQueue, cl.Buffer
     return result, M
 
 
-def init_opencl() -> tuple[cl.Context, cl.CommandQueue, cl.Buffer, np.ndarray]:
+def init_opencl(
+    allow_cpu: bool = False,
+) -> tuple[cl.Context, cl.CommandQueue, cl.Buffer, np.ndarray]:
     """
     Initialise PyOpenCL context, upload M to GPU, return (ctx, queue, M_buf, M).
-    Works on any platform (Apple Silicon, NVIDIA, AMD).
+    Works on any platform (Apple Silicon, NVIDIA, AMD).  Set allow_cpu=True
+    for local smoke tests on machines where only a CPU OpenCL device exists.
     """
     device = None
     chosen_platform = None
+    device_kind = "GPU"
     for platform in cl.get_platforms():
-        gpu_devs = platform.get_devices(device_type=cl.device_type.GPU)
+        gpu_devs = _devices_for(platform, cl.device_type.GPU)
         if gpu_devs:
             device = gpu_devs[0]
             chosen_platform = platform
             break
+    if device is None and allow_cpu:
+        for platform in cl.get_platforms():
+            cpu_devs = _devices_for(platform, cl.device_type.CPU)
+            if cpu_devs:
+                device = cpu_devs[0]
+                chosen_platform = platform
+                device_kind = "CPU"
+                break
     if device is None:
+        kind = "GPU/CPU" if allow_cpu else "GPU"
         raise RuntimeError(
-            "No OpenCL GPU device found on any platform. "
+            f"No OpenCL {kind} device found on any platform. "
             "Platforms: " + str([p.name for p in cl.get_platforms()])
         )
     ctx   = cl.Context([device])
@@ -95,7 +120,7 @@ def init_opencl() -> tuple[cl.Context, cl.CommandQueue, cl.Buffer, np.ndarray]:
     M_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
                       hostbuf=M)
     print(f"[precompute] OpenCL platform : {chosen_platform.name}")
-    print(f"[precompute] Device          : {device.name}  (type=GPU)")
+    print(f"[precompute] Device          : {device.name}  (type={device_kind})")
     return ctx, queue, M_buf, M
 
 

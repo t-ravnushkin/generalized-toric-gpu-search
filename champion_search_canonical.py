@@ -333,6 +333,7 @@ def canonical_champion_search(
     prune_margin: int | None = None,
     resume: bool = True,
     k_canonical_max: int = 10,
+    prune_eval_mode: str = "champion",
 ):
     """
     Hybrid champion search: GPU canonical forms for k ≤ k_canonical_max,
@@ -352,10 +353,19 @@ def canonical_champion_search(
     prune_margin:
       None  — keep ALL surviving k-forms for the next level.
       int   — prune sets with min_distance < targets[k] - prune_margin.
-              The GPU abort threshold is lowered to the same survivor cutoff,
-              so loose margins do not keep candidates whose distances were
-              only partially evaluated against the champion threshold.
+
+    prune_eval_mode:
+      "champion" — fast record-hunting mode.  Evaluate at targets[k], so most
+                   non-champions abort early.  Survivor pruning is optimistic:
+                   it never discards a set that might meet the margin cutoff,
+                   but may keep false positives for later levels.
+      "survivor" — exact survivor-pruning mode.  Evaluate at
+                   targets[k] - prune_margin, which gives an honest frontier
+                   but can be much slower for loose margins at k≥10.
     """
+    if prune_eval_mode not in {"champion", "survivor"}:
+        raise ValueError("prune_eval_mode must be 'champion' or 'survivor'")
+
     gl2    = _gl2()
     n_gpus = len(oracles) if hasattr(oracles, "__len__") else 1
     if not isinstance(oracles, list):
@@ -372,7 +382,8 @@ def canonical_champion_search(
 
     print(f"\n=== Hybrid Champion Search  max_k={max_k}  gpus={n_gpus}  "
           f"k_canonical_max={k_canonical_max}  "
-          f"prune={'none' if prune_margin is None else prune_margin} ===\n"
+          f"prune={'none' if prune_margin is None else prune_margin}  "
+          f"prune_eval={prune_eval_mode} ===\n"
           f"    GPU canonical (AGL₂) for k≤{k_canonical_max}; "
           f"raw-BFS for k>{k_canonical_max}\n")
 
@@ -387,7 +398,11 @@ def canonical_champion_search(
     for k in range(start_k + 1, max_k + 1):
         td = targets.get(k, 1)
         keep_distance = 1 if prune_margin is None else max(1, td - prune_margin)
-        eval_distance = td if prune_margin is None else keep_distance
+        eval_distance = (
+            td
+            if prune_margin is None or prune_eval_mode == "champion"
+            else keep_distance
+        )
 
         # ── Expand raw extensions ─────────────────────────────────────────
         t0 = time.perf_counter()
@@ -416,6 +431,7 @@ def canonical_champion_search(
         t_total = time.perf_counter() - t0
         print(f"  k={k}: {n_cands:,} {mode_label}  target_d={td}  "
               f"keep_d≥{keep_distance if prune_margin is not None else 'all'}  "
+              f"eval_d={eval_distance}  "
               f"time={t_total:.1f}s")
 
         # ── Record champions and survivors ────────────────────────────────
@@ -446,10 +462,18 @@ def canonical_champion_search(
 
         append_result({"type": "level_complete", "k": k,
                        "n_canonical": n_cands, "n_champions": n_champ,
-                       "n_survivors": len(next_level)}, results_file)
+                       "n_survivors": len(next_level),
+                       "prune_eval_mode": prune_eval_mode,
+                       "eval_distance": eval_distance,
+                       "keep_distance": keep_distance}, results_file)
 
+        survivor_label = (
+            "optimistic survivors"
+            if prune_margin is not None and prune_eval_mode == "champion"
+            else "survivors"
+        )
         print(f"  k={k}: {n_champ} champions (d≥{td}), "
-              f"{len(next_level):,} survivors\n")
+              f"{len(next_level):,} {survivor_label}\n")
 
         if not next_level:
             print(f"  *** 0 survivors — BFS frontier exhausted at k={k} ***")
@@ -495,6 +519,7 @@ def main() -> Path:
         prune_margin    = None,
         resume          = True,
         k_canonical_max = 10,
+        prune_eval_mode = "champion",
     )
     return results_file
 
