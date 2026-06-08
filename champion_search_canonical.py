@@ -219,25 +219,38 @@ def canonical_champion_search(
     batch_size: int = 50_000,
     prune_margin: int | None = None,
     resume: bool = True,
+    k_canonical_max: int = 9,
 ):
     """
-    Complete canonical-form champion search.
+    Hybrid champion search: canonical forms for k ≤ k_canonical_max,
+    raw sorted-tuple BFS for k > k_canonical_max.
+
+    For small k the AGL₂(F₇) orbit reduction (×98,784) makes canonicalization
+    worthwhile.  Above k_canonical_max the GL₂ loop over 2016 matrices becomes
+    the CPU bottleneck while the GPU sits idle; switching to raw-tuple
+    deduplication (O(1) numpy) keeps the GPU fully utilised at the cost of
+    evaluating AGL-equivalent sets multiple times.
+
+    k_canonical_max:
+      k ≤ this — full GL₂ canonical forms (complete, CPU-heavy at large k).
+      k > this — sorted-tuple deduplication only (GPU-bound, slight redundancy).
+      Default 9 matches the inflection point where canonical-form count jumps
+      from ~25K (k=9) to ~100K (k=10), making GL₂ cost dominant.
 
     prune_margin:
-      None  — keep ALL canonical k-forms for the next level (complete).
-              Recommended for k ≤ 10 where counts stay ≤ ~100K.
+      None  — keep ALL surviving k-forms for the next level.
       int   — prune sets with min_distance < targets[k] - prune_margin.
-              Trades completeness for tractability at k ≥ 11.
     """
     gl2 = _gl2()
     n_gpus = len(oracles) if hasattr(oracles, "__len__") else 1
     if not isinstance(oracles, list):
         oracles = [oracles]
 
-    print(f"\n=== Canonical Champion Search  max_k={max_k}  "
-          f"gpus={n_gpus}  "
-          f"prune={'none (complete)' if prune_margin is None else prune_margin} ===\n"
-          f"    |AGL₂(F₇)| = 98,784  (49 translations × 2016 linear maps)\n")
+    print(f"\n=== Hybrid Champion Search  max_k={max_k}  gpus={n_gpus}  "
+          f"k_canonical_max={k_canonical_max}  "
+          f"prune={'none' if prune_margin is None else prune_margin} ===\n"
+          f"    canonical (AGL₂, complete) for k≤{k_canonical_max}; "
+          f"raw-BFS (GPU-bound) for k>{k_canonical_max}\n")
 
     # ── Resume support ────────────────────────────────────────────────────
     start_k, canonical_level = 1, {0}
@@ -265,18 +278,26 @@ def canonical_champion_search(
                 if p not in s_set:
                     raw.append(tuple(sorted(S + (p,))))
 
-        # Deduplicate raw before the heavier canonicalization pass
+        # Deduplicate raw before the packing pass
         raw = list(dict.fromkeys(raw))   # preserves order, removes dupes
 
-        # Canonicalize in chunks
+        # Pack in chunks.
+        # k ≤ k_canonical_max: full GL₂ canonical form (complete, CPU-heavy).
+        # k > k_canonical_max: direct sorted-tuple packing (O(1), GPU-bound).
+        use_canonical = (k <= k_canonical_max)
+        _shifts = np.arange(k, dtype=np.uint64) * 6   # shared by both paths
+
         seen_packed:    set[int]             = set()
         new_packed:     list[int]            = []
         new_indices:    list[tuple[int,...]] = []
 
         for ci in range(0, len(raw), _CANON_CHUNK):
             chunk_arr = np.array(raw[ci: ci + _CANON_CHUNK], dtype=np.int32)
-            packed    = canonical_forms_batch(chunk_arr, gl2)
-            for pi, p_val in enumerate(packed.tolist()):
+            if use_canonical:
+                packed = canonical_forms_batch(chunk_arr, gl2)
+            else:
+                packed = (chunk_arr.astype(np.uint64) << _shifts).sum(axis=1)
+            for p_val in packed.tolist():
                 if p_val not in seen_packed:
                     seen_packed.add(p_val)
                     new_packed.append(p_val)
@@ -284,7 +305,8 @@ def canonical_champion_search(
 
         n_cands = len(new_indices)
         t_expand = time.perf_counter() - t0
-        print(f"  k={k}: {n_cands:,} canonical forms  "
+        mode_label = "canonical forms" if use_canonical else "raw-BFS sets"
+        print(f"  k={k}: {n_cands:,} {mode_label}  "
               f"target_d={td}  expand={t_expand:.1f}s")
 
         # ── Evaluate on GPU ───────────────────────────────────────────────
@@ -338,7 +360,7 @@ def canonical_champion_search(
                 print(f"      Try increasing prune_margin (currently {prune_margin}).")
             break
 
-        canonical_level = next_level  # noqa: SIM107 — used next iteration
+        canonical_level = next_level
 
 
 # ---------------------------------------------------------------------------
@@ -367,14 +389,15 @@ def main() -> Path:
     print(f"Results → {results_file}")
 
     canonical_champion_search(
-        oracles      = oracles,
-        lattice      = lattice,
-        results_file = results_file,
-        targets      = targets,
-        max_k        = 12,
-        batch_size   = bs,
-        prune_margin = None,
-        resume       = True,
+        oracles         = oracles,
+        lattice         = lattice,
+        results_file    = results_file,
+        targets         = targets,
+        max_k           = 12,
+        batch_size      = bs,
+        prune_margin    = None,
+        resume          = True,
+        k_canonical_max = 9,
     )
     return results_file
 
