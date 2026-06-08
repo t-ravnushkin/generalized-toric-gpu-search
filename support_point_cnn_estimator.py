@@ -12,7 +12,7 @@ Smoke-test the whole workflow with synthetic data::
 
     python support_point_cnn_estimator.py --smoke-test --epochs 1
 
-Train/validate from existing canonical search JSONL files::
+Train/validate from existing canonical search JSON/JSONL/CSV files::
 
     python support_point_cnn_estimator.py --data canon_20260608_125209\(1\).json \
         --model-out support_point_cnn_model.npz
@@ -26,6 +26,8 @@ Score all one-point extensions of a base support::
 from __future__ import annotations
 
 import argparse
+import ast
+import csv
 import json
 import math
 import random
@@ -48,12 +50,17 @@ class Example:
 
 
 def _iter_json_records(path: Path) -> Iterable[dict]:
-    """Yield records from JSONL, a JSON object, or a JSON array.
+    """Yield records from CSV, JSONL, a JSON object, or a JSON array.
 
     Some long-running search outputs in this repo are interrupted JSON arrays:
     they contain many complete objects followed by a truncated final object.
     For those, salvage the complete prefix instead of failing the whole run.
     """
+    if path.suffix.lower() == ".csv":
+        with path.open(newline="") as f:
+            yield from csv.DictReader(f)
+        return
+
     text = path.read_text().strip()
     if not text:
         return
@@ -111,13 +118,32 @@ def _iter_json_records(path: Path) -> Iterable[dict]:
                 raise ValueError(f"Could not parse {path} as JSON/JSONL at line {line_no}: {exc}") from exc
 
 
+def _parse_sequence(value: object) -> object:
+    """Parse JSON/CSV string encodings of supports or lattice-point lists."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return None
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            return parser(text)
+        except (json.JSONDecodeError, SyntaxError, ValueError, TypeError):
+            pass
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
 def _indices_from_record(record: dict) -> tuple[int, ...] | None:
     if "indices" in record:
-        indices = record["indices"]
+        indices = _parse_sequence(record["indices"])
     elif "support" in record:
-        indices = record["support"]
+        indices = _parse_sequence(record["support"])
     elif "lattice_points" in record:
-        indices = [int(a) * GRID + int(b) for a, b in record["lattice_points"]]
+        points = _parse_sequence(record["lattice_points"])
+        try:
+            indices = [int(a) * GRID + int(b) for a, b in points]
+        except (TypeError, ValueError):
+            return None
     else:
         return None
 
@@ -131,14 +157,15 @@ def _indices_from_record(record: dict) -> tuple[int, ...] | None:
 
 
 def _target_from_record(record: dict, target_field: str) -> float | None:
-    if target_field in record:
+    if target_field in record and record[target_field] not in (None, ""):
         return float(record[target_field])
     if target_field == "min_distance":
-        if "sampled_min_distance" in record:
-            return float(record["sampled_min_distance"])
-        if "max_zeros" in record:
+        for key in ("actual_min_distance_cuda_bp", "exact_min_distance", "true_distance", "sampled_min_distance"):
+            if key in record and record[key] not in (None, ""):
+                return float(record[key])
+        if "max_zeros" in record and record["max_zeros"] not in (None, ""):
             return float(N_POINTS - int(record["max_zeros"]))
-        if "sampled_max_zeros" in record:
+        if "sampled_max_zeros" in record and record["sampled_max_zeros"] not in (None, ""):
             return float(N_POINTS - int(record["sampled_max_zeros"]))
     return None
 
@@ -453,11 +480,38 @@ def train_validation_split(
 
 def evaluate(estimator: RidgeCnnEstimator, examples: Sequence[Example]) -> dict[str, float]:
     if not examples:
-        return {"count": 0.0, "mae": float("nan"), "rmse": float("nan")}
+        return {
+            "count": 0.0,
+            "mse": float("nan"),
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "bias": float("nan"),
+            "acc_pm3": float("nan"),
+            "actual_std": float("nan"),
+            "pred_std": float("nan"),
+        }
     preds = estimator.predict_indices([ex.indices for ex in examples])
     y = np.asarray([ex.target for ex in examples], dtype=np.float64)
     err = preds - y
-    return {"count": float(len(examples)), "mae": float(np.mean(np.abs(err))), "rmse": float(np.sqrt(np.mean(err * err)))}
+    mse = float(np.mean(err * err))
+    return {
+        "count": float(len(examples)),
+        "mse": mse,
+        "mae": float(np.mean(np.abs(err))),
+        "rmse": float(math.sqrt(mse)),
+        "bias": float(np.mean(err)),
+        "acc_pm3": float(np.mean(np.abs(err) <= 3.0)),
+        "actual_std": float(np.std(y)),
+        "pred_std": float(np.std(preds)),
+    }
+
+
+def format_metrics(metrics: dict[str, float]) -> str:
+    return (
+        f"MSE={metrics['mse']:.3f} MAE={metrics['mae']:.3f} RMSE={metrics['rmse']:.3f} "
+        f"bias={metrics['bias']:.3f} acc_pm3={metrics['acc_pm3'] * 100.0:.2f}% "
+        f"actual_std={metrics['actual_std']:.3f} pred_std={metrics['pred_std']:.3f}"
+    )
 
 
 def one_point_extensions(base: Sequence[int]) -> list[tuple[int, ...]]:
@@ -492,7 +546,7 @@ def _parse_support(text: str) -> tuple[int, ...]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", nargs="*", type=Path, help="JSONL/JSON result files with indices and min_distance/max_zeros")
+    parser.add_argument("--data", nargs="*", type=Path, help="JSONL/JSON/CSV result files with indices and min_distance/max_zeros")
     parser.add_argument("--target-field", default="min_distance", help="record field to learn (default: min_distance)")
     parser.add_argument("--model-out", type=Path, default=Path("support_point_cnn_model.npz"))
     parser.add_argument("--model-in", type=Path, help="load an existing .npz model instead of training")
@@ -532,9 +586,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         train_metrics = evaluate(estimator, train)
         val_metrics = evaluate(estimator, val)
         print(f"Examples: train={len(train)} validation={len(val)}")
-        print(f"Train MAE={train_metrics['mae']:.3f} RMSE={train_metrics['rmse']:.3f}")
+        print(f"Train {format_metrics(train_metrics)}")
         if val:
-            print(f"Validation MAE={val_metrics['mae']:.3f} RMSE={val_metrics['rmse']:.3f}")
+            print(f"Validation {format_metrics(val_metrics)}")
         print(f"Saved model: {args.model_out}")
 
     if args.score_base is not None:

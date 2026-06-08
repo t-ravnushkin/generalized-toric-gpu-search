@@ -35,6 +35,7 @@ from support_point_cnn_estimator import (
     N_POINTS,
     RidgeCnnEstimator,
     evaluate,
+    format_metrics,
     load_examples,
     synthetic_examples,
     train_estimator,
@@ -244,9 +245,9 @@ def build_estimator(args: argparse.Namespace) -> RidgeCnnEstimator:
     print(f"Training examples: train={len(train)} validation={len(val)}")
     train_metrics = evaluate(estimator, train)
     val_metrics = evaluate(estimator, val)
-    print(f"Train MAE={train_metrics['mae']:.3f} RMSE={train_metrics['rmse']:.3f}")
+    print(f"Train {format_metrics(train_metrics)}")
     if val:
-        print(f"Validation MAE={val_metrics['mae']:.3f} RMSE={val_metrics['rmse']:.3f}")
+        print(f"Validation {format_metrics(val_metrics)}")
     if args.model_out is not None:
         estimator.save(args.model_out)
         print(f"Saved model: {args.model_out}")

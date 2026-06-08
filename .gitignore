@@ -6,6 +6,18 @@ __pycache__/
 kaggle*
 .pi
 
+# Local datasets, cloned repos/datasets, and generated experiment artifacts.
+# Keep external/downloaded data out of commits; store it under data/external/
+# or cnnruns/ when possible.
+/data/external/*
+!/data/external/.gitkeep
+!/data/external/README.md
+/cnnruns/*
+/support_point_cnn_runs/*
+/generalized-toric-gpu-search/
+/data/cloned/
+/data/kaggle/
+
 *.json
 *.npz
 .*_cache.txt
