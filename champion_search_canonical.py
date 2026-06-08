@@ -138,7 +138,8 @@ def unpack_canonical(packed: int, k: int) -> tuple[int, ...]:
     """Unpack a canonical packed value.
     k≤10 : 6 bits per index, positions 0..k-1  (position 0 explicit, always 0).
     k≥11 : position 0 implicit 0; positions 1..k-1 at bits 0..6(k-1)-1.
-           k=11 → 60-bit int; k=12 → 66-bit Python int (lo | hi<<64)."""
+           k=11 → 60-bit int; k=12 → 66-bit Python int (lo | hi<<64).
+           Raw-BFS for k≥11 uses the same skip-pos-0 convention."""
     if k <= 10:
         return tuple(int((packed >> (6 * i)) & 63) for i in range(k))
     return (0,) + tuple(int((packed >> (6 * i)) & 63) for i in range(k - 1))
@@ -263,12 +264,20 @@ def _pipelined_eval(
                 packed_vals = packed_arr.tolist()
                 index_vals  = [unpack_canonical(p, k) for p in packed_vals]
             else:
-                # Raw-BFS: Python-int packing avoids uint64 overflow at k ≥ 11.
+                # Raw-BFS: use skip-pos-0 for k≥11 to match GPU canonical convention
+                # so unpack_canonical works uniformly across both paths.
                 chunk_list  = chunk.tolist()
-                packed_vals = [
-                    sum(v << (6 * j) for j, v in enumerate(row))
-                    for row in chunk_list
-                ]
+                if k <= 10:
+                    packed_vals = [
+                        sum(v << (6 * j) for j, v in enumerate(row))
+                        for row in chunk_list
+                    ]
+                else:
+                    # position 0 always 0 (implicit); pack positions 1..k-1
+                    packed_vals = [
+                        sum(row[j] << (6 * (j - 1)) for j in range(1, k))
+                        for row in chunk_list
+                    ]
                 index_vals = [tuple(row) for row in chunk_list]
 
             for p, idx in zip(packed_vals, index_vals):
