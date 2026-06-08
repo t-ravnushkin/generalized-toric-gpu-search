@@ -136,11 +136,11 @@ def canonical_forms_batch(
 
 def unpack_canonical(packed: int, k: int) -> tuple[int, ...]:
     """Unpack a canonical packed value.
-    k≤10: standard 6-bits-per-index, positions 0..k-1.
-    k=11: position 0 is implicit 0; bits 0..59 encode positions 1..10."""
+    k≤10 : 6 bits per index, positions 0..k-1  (position 0 explicit, always 0).
+    k≥11 : position 0 implicit 0; positions 1..k-1 at bits 0..6(k-1)-1.
+           k=11 → 60-bit int; k=12 → 66-bit Python int (lo | hi<<64)."""
     if k <= 10:
         return tuple(int((packed >> (6 * i)) & 63) for i in range(k))
-    # k=11: leading 0 is not stored
     return (0,) + tuple(int((packed >> (6 * i)) & 63) for i in range(k - 1))
 
 
