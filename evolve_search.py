@@ -303,6 +303,22 @@ def recheck_candidate(
     return distances
 
 
+def complete_check_candidate(
+    oracles,
+    candidate: tuple[int, ...],
+    target_d: int,
+) -> tuple[bool, int, int]:
+    """Run the complete kernel at target_d.
+
+    If it passes, the returned distance is exact: no early abort happened, so
+    the kernel saw every nonzero codeword. If it fails, the distance is only a
+    witness upper bound and should not be reported as the actual distance.
+    """
+    mz = _dispatch(oracles, [candidate], target_d, 0, 0)[0]
+    d = N_POINTS - mz
+    return d >= target_d, d, mz
+
+
 def run_evolution(
     *,
     k: int,
@@ -323,6 +339,7 @@ def run_evolution(
     results_file: Path,
     oracles_info: tuple | None = None,
     log_every: int = 1,
+    complete_recheck: bool = False,
 ) -> Path:
     if not (1 <= k <= N_POINTS):
         raise ValueError("k must be in 1..49")
@@ -363,6 +380,7 @@ def run_evolution(
             "sample_count": sample_count,
             "recheck_sample_count": recheck_sample_count,
             "recheck_rounds": recheck_rounds,
+            "complete_recheck": complete_recheck,
             "seed": seed,
         },
     )
@@ -412,47 +430,81 @@ def run_evolution(
                 f"time={elapsed:5.1f}s"
             )
 
-        should_recheck = (
-            recheck_sample_count > 0
-            and recheck_rounds > 0
-            and (gen == 1 or gen % recheck_every == 0 or n_at_target > 0)
-        )
+        if complete_recheck:
+            should_recheck = gen == generations or (
+                recheck_every > 0 and gen % recheck_every == 0
+            )
+        else:
+            should_recheck = (
+                recheck_sample_count > 0
+                and recheck_rounds > 0
+                and (gen == 1 or gen % recheck_every == 0 or n_at_target > 0)
+            )
         if should_recheck:
-            finalists = [item for item in scored if item[1] >= target_d]
-            finalists.extend(scored[:recheck_top])
+            if complete_recheck:
+                finalists = scored[:recheck_top]
+            else:
+                finalists = [item for item in scored if item[1] >= target_d]
+                finalists.extend(scored[:recheck_top])
             seen_finalists: set[tuple[int, ...]] = set()
             for candidate, sampled_d, sampled_mz in finalists:
                 if candidate in seen_finalists or candidate in logged:
                     continue
                 seen_finalists.add(candidate)
-                distances = recheck_candidate(
-                    oracles,
-                    candidate,
-                    target_d,
-                    recheck_sample_count,
-                    recheck_rounds,
-                    seed + gen * 100_000_007,
-                )
-                if min(distances) >= target_d:
+                if complete_recheck:
+                    verified, distance, max_zeros = complete_check_candidate(
+                        oracles, candidate, target_d
+                    )
+                    if not verified:
+                        continue
                     logged.add(candidate)
                     record = {
                         "type": "candidate",
-                        "verified": False,
-                        "name": f"evolve_k{k}_sample_d{min(distances)}",
+                        "verified": True,
+                        "verification": "complete_kernel",
+                        "name": f"evolve_k{k}_d{distance}",
                         "indices": list(candidate),
                         "lattice_points": [lattice[i] for i in candidate],
                         "k": k,
                         "best_known_d": target_d,
+                        "min_distance": distance,
+                        "max_zeros": max_zeros,
                         "sampled_min_distance": sampled_d,
                         "sampled_max_zeros": sampled_mz,
-                        "recheck_min_distance": min(distances),
-                        "recheck_distances": distances,
                         "sample_count": sample_count,
-                        "recheck_sample_count": recheck_sample_count,
-                        "recheck_rounds": recheck_rounds,
+                        "complete_recheck": True,
                         "generation": gen,
                     }
                     append_jsonl(results_file, record)
+                else:
+                    distances = recheck_candidate(
+                        oracles,
+                        candidate,
+                        target_d,
+                        recheck_sample_count,
+                        recheck_rounds,
+                        seed + gen * 100_000_007,
+                    )
+                    if min(distances) >= target_d:
+                        logged.add(candidate)
+                        record = {
+                            "type": "candidate",
+                            "verified": False,
+                            "name": f"evolve_k{k}_sample_d{min(distances)}",
+                            "indices": list(candidate),
+                            "lattice_points": [lattice[i] for i in candidate],
+                            "k": k,
+                            "best_known_d": target_d,
+                            "sampled_min_distance": sampled_d,
+                            "sampled_max_zeros": sampled_mz,
+                            "recheck_min_distance": min(distances),
+                            "recheck_distances": distances,
+                            "sample_count": sample_count,
+                            "recheck_sample_count": recheck_sample_count,
+                            "recheck_rounds": recheck_rounds,
+                            "generation": gen,
+                        }
+                        append_jsonl(results_file, record)
 
         ranked_parent_pool = scored[: min(parent_pool, len(scored))]
         next_population = [item[0] for item in scored[:elite_count]]
@@ -511,6 +563,11 @@ def main() -> None:
         default=1,
         help="print progress every N generations; 0 prints only first and last",
     )
+    parser.add_argument(
+        "--complete-recheck",
+        action="store_true",
+        help="use the complete kernel for final/top rechecks; passing candidates get exact min_distance",
+    )
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -550,6 +607,7 @@ def main() -> None:
         seed_sets=args.seed_set,
         results_file=results_file,
         log_every=args.log_every,
+        complete_recheck=args.complete_recheck,
     )
 
 
