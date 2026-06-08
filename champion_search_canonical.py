@@ -116,7 +116,13 @@ def canonical_forms_batch(
     sets_arr: np.ndarray,   # (n, k)  int32, each row sorted
     gl2_perms: np.ndarray,  # (2016, 49)  int32
 ) -> np.ndarray:
-    """CPU fallback: vectorised canonical form for n k-sets. Returns uint64 (n,)."""
+    """CPU fallback: vectorised canonical form for n k-sets. Returns uint64 (n,).
+
+    This reference path packs all k positions into uint64, so it is limited to
+    k <= 10.  The CUDA canonical kernel supports larger 128-bit keys.
+    """
+    if sets_arr.shape[1] > 10:
+        raise ValueError("CPU canonical fallback supports k <= 10")
     _CHUNK = 64
     n, k = sets_arr.shape
     rt   = _rel_table()
@@ -132,6 +138,16 @@ def canonical_forms_batch(
                 packed |= idx[:, :, j].astype(np.uint64) << np.uint64(6 * j)
             np.minimum(best, packed.min(axis=0), out=best)
     return best
+
+
+class CPUCanonicalOracle:
+    """Local canonical-form fallback for machines without CUDA/CuPy."""
+
+    def __init__(self, gl2_perms: np.ndarray):
+        self.gl2_perms = gl2_perms
+
+    def compute(self, sets: np.ndarray) -> np.ndarray:
+        return canonical_forms_batch(sets, self.gl2_perms).astype(object)
 
 
 def unpack_canonical(packed: int, k: int) -> tuple[int, ...]:
@@ -371,14 +387,20 @@ def canonical_champion_search(
     if not isinstance(oracles, list):
         oracles = [oracles]
 
-    # Initialise the GPU canonical-form kernel (compile once, reuse every level).
+    # Initialise canonical-form engine (compile once on CUDA; CPU fallback locally).
     canon_oracle = None
-    if _HAS_GPU_CANON and k_canonical_max > 0:
+    if _HAS_GPU_CANON and k_canonical_max > 0 and hasattr(oracles[0], "device_id"):
         canon_oracle = init_canon_oracle(
             device_id = oracles[0].device_id,
             gl2_perms = gl2,
             rel_table = _rel_table(),
         )
+    elif k_canonical_max > 0:
+        if k_canonical_max > 10:
+            print("[canon] CUDA canonical kernel unavailable; "
+                  "using CPU canonical fallback for k≤10")
+            k_canonical_max = 10
+        canon_oracle = CPUCanonicalOracle(gl2)
 
     print(f"\n=== Hybrid Champion Search  max_k={max_k}  gpus={n_gpus}  "
           f"k_canonical_max={k_canonical_max}  "
