@@ -214,12 +214,38 @@ def load_canonical_state(path: Path) -> tuple[int, set[int]]:
 # Multi-GPU dispatch
 # ---------------------------------------------------------------------------
 
-def _dispatch(oracles, batch: list[list[int]], td: int) -> list[int]:
+def _call_max_zeros_batch(
+    oracle,
+    batch: list[list[int]],
+    td: int,
+    sample_count: int,
+    sample_seed: int,
+) -> list[int]:
+    if sample_count <= 0:
+        return oracle.max_zeros_batch(batch, td)
+    try:
+        return oracle.max_zeros_batch(
+            batch, td, sample_count=sample_count, sample_seed=sample_seed
+        )
+    except TypeError as exc:
+        raise TypeError(
+            "This distance oracle does not support sampled evaluation. "
+            "Use kernel_cuda_bp.py or set SCREEN_SAMPLE_COUNT=0."
+        ) from exc
+
+
+def _dispatch(
+    oracles,
+    batch: list[list[int]],
+    td: int,
+    sample_count: int = 0,
+    sample_seed: int = 0,
+) -> list[int]:
     if not batch:
         return []
     n = len(oracles)
     if n == 1:
-        return oracles[0].max_zeros_batch(batch, td)
+        return _call_max_zeros_batch(oracles[0], batch, td, sample_count, sample_seed)
     q, r = divmod(len(batch), n)
     sizes = [q + (1 if i < r else 0) for i in range(n)]
     chunks, start = [], 0
@@ -227,8 +253,18 @@ def _dispatch(oracles, batch: list[list[int]], td: int) -> list[int]:
         chunks.append(batch[start: start + s])
         start += s
     with ThreadPoolExecutor(max_workers=n) as pool:
-        futures = [pool.submit(o.max_zeros_batch, c, td)
-                   for o, c in zip(oracles, chunks) if c]
+        futures = [
+            pool.submit(
+                _call_max_zeros_batch,
+                o,
+                c,
+                td,
+                sample_count,
+                sample_seed + dev_id * 1_000_003,
+            )
+            for dev_id, (o, c) in enumerate(zip(oracles, chunks))
+            if c
+        ]
         results = []
         for f in futures:
             results.extend(f.result())
@@ -249,6 +285,8 @@ def _pipelined_eval(
     eval_distance: int,
     batch_size: int,
     oracles: list,
+    sample_count: int = 0,
+    sample_seed: int = 0,
 ) -> tuple[list[int], list[tuple[int, ...]], list[int]]:
     """
     Overlap GPU canonical-form computation with GPU evaluation.
@@ -318,7 +356,13 @@ def _pipelined_eval(
                 pbar.close()
                 return
             bp, bi = item
-            mz = _dispatch(oracles, [list(s) for s in bi], eval_distance)
+            mz = _dispatch(
+                oracles,
+                [list(s) for s in bi],
+                eval_distance,
+                sample_count=sample_count,
+                sample_seed=sample_seed,
+            )
             packed_out.extend(bp)
             indices_out.extend(bi)
             mz_out.extend(mz)
@@ -350,6 +394,10 @@ def canonical_champion_search(
     resume: bool = True,
     k_canonical_max: int = 10,
     prune_eval_mode: str = "champion",
+    screen_from_k: int | None = None,
+    screen_sample_count: int = 0,
+    screen_seed: int = 1,
+    screen_candidate_log_limit: int = 200,
 ):
     """
     Hybrid champion search: GPU canonical forms for k ≤ k_canonical_max,
@@ -378,6 +426,12 @@ def canonical_champion_search(
       "survivor" — exact survivor-pruning mode.  Evaluate at
                    targets[k] - prune_margin, which gives an honest frontier
                    but can be much slower for loose margins at k≥10.
+
+    screen_from_k / screen_sample_count:
+      Optional sampled screening for deep levels.  For k >= screen_from_k,
+      evaluate only screen_sample_count pseudo-random nonzero coefficient
+      vectors per set.  This keeps searches moving at k≥12, but distances and
+      champions from screened levels are NOT certified.
     """
     if prune_eval_mode not in {"champion", "survivor"}:
         raise ValueError("prune_eval_mode must be 'champion' or 'survivor'")
@@ -408,6 +462,10 @@ def canonical_champion_search(
           f"prune_eval={prune_eval_mode} ===\n"
           f"    GPU canonical (AGL₂) for k≤{k_canonical_max}; "
           f"raw-BFS for k>{k_canonical_max}\n")
+    if screen_from_k is not None and screen_sample_count > 0:
+        print(f"    sampled screening for k≥{screen_from_k}: "
+              f"{screen_sample_count:,} random codewords/set "
+              f"(unverified distances)\n")
 
     # ── Resume support ────────────────────────────────────────────────────
     start_k, canonical_level = 1, {0}
@@ -425,6 +483,12 @@ def canonical_champion_search(
             if prune_margin is None or prune_eval_mode == "champion"
             else keep_distance
         )
+        sample_count = (
+            screen_sample_count
+            if screen_from_k is not None and k >= screen_from_k
+            else 0
+        )
+        is_screened = sample_count > 0
 
         # ── Expand raw extensions ─────────────────────────────────────────
         t0 = time.perf_counter()
@@ -446,7 +510,14 @@ def canonical_champion_search(
         mode_label = "canonical forms" if co is not None else "raw-BFS sets"
 
         new_packed, new_indices, all_mz = _pipelined_eval(
-            raw, co, k, eval_distance, batch_size, oracles
+            raw,
+            co,
+            k,
+            eval_distance,
+            batch_size,
+            oracles,
+            sample_count=sample_count,
+            sample_seed=screen_seed + k * 1_000_003,
         )
 
         n_cands = len(new_indices)
@@ -454,15 +525,17 @@ def canonical_champion_search(
         print(f"  k={k}: {n_cands:,} {mode_label}  target_d={td}  "
               f"keep_d≥{keep_distance if prune_margin is not None else 'all'}  "
               f"eval_d={eval_distance}  "
+              f"{'sampled=' + format(sample_count, ',') + '  ' if is_screened else ''}"
               f"time={t_total:.1f}s")
 
         # ── Record champions and survivors ────────────────────────────────
         next_level: set[int] = set()
         n_champ = 0
+        n_screen_candidates_logged = 0
 
         for packed_j, S, mz in zip(new_packed, new_indices, all_mz):
             d = 49 - mz
-            if d >= td:
+            if d >= td and not is_screened:
                 n_champ += 1
                 append_result({
                     "name":         f"canon_k{k}_d{d}",
@@ -473,6 +546,24 @@ def canonical_champion_search(
                     "min_distance": d,
                     "best_known_d": td,
                     "new_record":   d > td,
+                }, results_file)
+            elif (
+                d >= td
+                and is_screened
+                and n_screen_candidates_logged < screen_candidate_log_limit
+            ):
+                n_screen_candidates_logged += 1
+                append_result({
+                    "type":         "candidate",
+                    "verified":     False,
+                    "name":         f"screen_k{k}_sample_d{d}",
+                    "indices":      list(S),
+                    "lattice_points": [lattice[i] for i in S],
+                    "k":            k,
+                    "sampled_max_zeros": mz,
+                    "sampled_min_distance": d,
+                    "best_known_d": td,
+                    "sample_count": sample_count,
                 }, results_file)
 
             keep = (prune_margin is None) or (d >= keep_distance)
@@ -487,15 +578,22 @@ def canonical_champion_search(
                        "n_survivors": len(next_level),
                        "prune_eval_mode": prune_eval_mode,
                        "eval_distance": eval_distance,
-                       "keep_distance": keep_distance}, results_file)
+                       "keep_distance": keep_distance,
+                       "screen_sample_count": sample_count,
+                       "verified": not is_screened}, results_file)
 
         survivor_label = (
             "optimistic survivors"
             if prune_margin is not None and prune_eval_mode == "champion"
             else "survivors"
         )
-        print(f"  k={k}: {n_champ} champions (d≥{td}), "
-              f"{len(next_level):,} {survivor_label}\n")
+        if is_screened:
+            print(f"  k={k}: sampled screening only; 0 verified champions, "
+                  f"{len(next_level):,} {survivor_label}, "
+                  f"{n_screen_candidates_logged} candidates logged\n")
+        else:
+            print(f"  k={k}: {n_champ} champions (d≥{td}), "
+                  f"{len(next_level):,} {survivor_label}\n")
 
         if not next_level:
             print(f"  *** 0 survivors — BFS frontier exhausted at k={k} ***")
@@ -542,6 +640,9 @@ def main() -> Path:
         resume          = True,
         k_canonical_max = 10,
         prune_eval_mode = "champion",
+        screen_from_k   = None,
+        screen_sample_count = 0,
+        screen_candidate_log_limit = 200,
     )
     return results_file
 

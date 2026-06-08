@@ -126,6 +126,8 @@ extern "C" __global__ void eval_min_distance_batch_bp(
     const int* __restrict__ M,
     const int* __restrict__ batched_s_idx,
     int k, int tmax_zeros, int num_sets,
+    long long sample_count,
+    unsigned long long sample_seed,
     int* out
 ) {
     int set_id = blockIdx.x;
@@ -149,13 +151,27 @@ extern "C" __global__ void eval_min_distance_batch_bp(
 
     const unsigned long long TORUS_MASK = (1ULL << 49) - 1;
     long long total_polys = (1LL << (3 * k)) - 1;
+    long long work_items = sample_count > 0 ? sample_count : total_polys;
     int thread_max  = 0;
 
-    for (long long poly_id = (long long)threadIdx.x + 1;
-         poly_id <= total_polys;
-         poly_id += blockDim.x)
+    for (long long work_id = (long long)threadIdx.x + 1;
+         work_id <= work_items;
+         work_id += blockDim.x)
     {
         if (*abort_flag) break;
+
+        long long poly_id = work_id;
+        if (sample_count > 0) {
+            unsigned long long x =
+                sample_seed ^
+                ((unsigned long long)set_id * 0x9E3779B97F4A7C15ULL) ^
+                ((unsigned long long)work_id * 0xBF58476D1CE4E5B9ULL);
+            x += 0x9E3779B97F4A7C15ULL;
+            x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+            x = x ^ (x >> 31);
+            poly_id = (long long)(x % (unsigned long long)total_polys) + 1LL;
+        }
 
         unsigned long long v0 = 0, v1 = 0, v2 = 0;
         long long tmp = poly_id;
@@ -229,7 +245,11 @@ class DistanceOracleCUDABP:
             return int(out_gpu[0])
 
     def max_zeros_batch(
-        self, batched_indices: list[list[int]], target_distance: int
+        self,
+        batched_indices: list[list[int]],
+        target_distance: int,
+        sample_count: int = 0,
+        sample_seed: int = 0,
     ) -> list[int]:
         num_sets = len(batched_indices)
         if num_sets == 0:
@@ -248,6 +268,7 @@ class DistanceOracleCUDABP:
                 (num_sets,), (self.BLOCK_SIZE,),
                 (self._M_gpu, s_gpu,
                  np.int32(k), np.int32(tmax_zeros), np.int32(num_sets),
+                 np.int64(sample_count), np.uint64(sample_seed),
                  out_gpu),
                 shared_mem=self._batch_smem(k),
             )
