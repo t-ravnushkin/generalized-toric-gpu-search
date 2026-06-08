@@ -11,8 +11,8 @@ warp-min reduction collapses to a (lo, hi) pair per set.
 Packing scheme (all formats are backward-compatible):
   k≤10 : positions 0..k-1,   6 bits each → ≤60 bits, hi=0
   k=11 : positions 1..10,    6 bits each → 60 bits  (skip pos 0, always 0), hi=0
-  k=12 : positions 1..11,    6 bits each → 66 bits  (pos 11 straddles lo/hi boundary)
-         lo = bits 0..63, hi = bits 64..65  (2 bits)
+  k=12..16 : positions 1..k-1, 6 bits each → up to 90 bits
+             lo = bits 0..63, hi = bits 64..89
 
 Python unpacking: unpack_canonical(packed, k) where packed = lo | (hi << 64).
 """
@@ -39,7 +39,7 @@ _CUDA_CANON_SRC = r"""
  *   bit_off = 6*(i - pack_from)
  *   bits [bit_off, bit_off+6) of the 128-bit word ← t[i]
  *   lo holds bits 0..63, hi holds bits 64..127.
- * For k≤11 hi is always 0.  For k=12 hi holds 2 bits (the overflow of pos 11).
+ * For k≤11 hi is always 0.  For k=12..16 hi holds overflow bits.
  */
 extern "C" __global__ void canonical_forms(
     const int*           __restrict__ sets,
@@ -54,7 +54,7 @@ extern "C" __global__ void canonical_forms(
     int lane       = global_tid & 31;
     if (set_idx >= n) return;
 
-    int S[12];
+    int S[16];
     for (int i = 0; i < k; i++)
         S[i] = sets[set_idx * k + i];
 
@@ -63,14 +63,14 @@ extern "C" __global__ void canonical_forms(
 
     for (int pi = lane; pi < N_PERMS; pi += 32) {
 
-        int perm[12];
+        int perm[16];
         for (int i = 0; i < k; i++)
             perm[i] = __ldg(perms + pi * N_POINTS + S[i]);
 
         for (int anc = 0; anc < k; anc++) {
             int anchor = perm[anc];
 
-            int t[12];
+            int t[16];
             for (int i = 0; i < k; i++)
                 t[i] = (int)rel_table[anchor * N_POINTS + perm[i]];
 
@@ -155,9 +155,11 @@ class CanonicalOracle:
 
         k≤10 : lo only (hi=0), same uint64 format as before.
         k=11 : 60-bit value in lo (hi=0).
-        k=12 : 66-bit value split across lo + hi; Python int = lo | (hi << 64).
+        k=12..16 : split across lo + hi; Python int = lo | (hi << 64).
         """
         n, k = sets.shape
+        if k > 16:
+            raise ValueError("GPU canonical kernel supports k <= 16")
         threads = self._THREADS
         grid    = (n * 32 + threads - 1) // threads
         with cp.cuda.Device(self.device_id):

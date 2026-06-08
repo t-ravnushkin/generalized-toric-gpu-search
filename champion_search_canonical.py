@@ -230,7 +230,7 @@ def _pipelined_eval(
     raw: list[tuple[int, ...]],
     canon_oracle,          # CanonicalOracle | None  (None → raw-BFS)
     k: int,
-    td: int,
+    eval_distance: int,
     batch_size: int,
     oracles: list,
 ) -> tuple[list[int], list[tuple[int, ...]], list[int]]:
@@ -302,7 +302,7 @@ def _pipelined_eval(
                 pbar.close()
                 return
             bp, bi = item
-            mz = _dispatch(oracles, [list(s) for s in bi], td)
+            mz = _dispatch(oracles, [list(s) for s in bi], eval_distance)
             packed_out.extend(bp)
             indices_out.extend(bi)
             mz_out.extend(mz)
@@ -343,15 +343,18 @@ def canonical_champion_search(
     anchors in parallel (one warp per set), keeping the GPU busy at all k.
 
     k_canonical_max:
-      k ≤ this — GPU GL₂ canonical forms (complete, uint64 packing requires
-                 k×6 ≤ 60 bits, so max is 10).
+      k ≤ this — GPU GL₂ canonical forms (complete; current kernel supports
+                 k ≤ 16 with 128-bit packed canonical keys).
       k > this — raw sorted-tuple BFS; Python-int packing avoids uint64
                  overflow at k ≥ 11.
-      Default 10 (extended from 9 once canonicalization moved to GPU).
+      Default 10 for conservative CLI runs; Kaggle notebook sets 15.
 
     prune_margin:
       None  — keep ALL surviving k-forms for the next level.
       int   — prune sets with min_distance < targets[k] - prune_margin.
+              The GPU abort threshold is lowered to the same survivor cutoff,
+              so loose margins do not keep candidates whose distances were
+              only partially evaluated against the champion threshold.
     """
     gl2    = _gl2()
     n_gpus = len(oracles) if hasattr(oracles, "__len__") else 1
@@ -383,6 +386,8 @@ def canonical_champion_search(
 
     for k in range(start_k + 1, max_k + 1):
         td = targets.get(k, 1)
+        keep_distance = 1 if prune_margin is None else max(1, td - prune_margin)
+        eval_distance = td if prune_margin is None else keep_distance
 
         # ── Expand raw extensions ─────────────────────────────────────────
         t0 = time.perf_counter()
@@ -404,12 +409,14 @@ def canonical_champion_search(
         mode_label = "canonical forms" if co is not None else "raw-BFS sets"
 
         new_packed, new_indices, all_mz = _pipelined_eval(
-            raw, co, k, td, batch_size, oracles
+            raw, co, k, eval_distance, batch_size, oracles
         )
 
         n_cands = len(new_indices)
         t_total = time.perf_counter() - t0
-        print(f"  k={k}: {n_cands:,} {mode_label}  target_d={td}  time={t_total:.1f}s")
+        print(f"  k={k}: {n_cands:,} {mode_label}  target_d={td}  "
+              f"keep_d≥{keep_distance if prune_margin is not None else 'all'}  "
+              f"time={t_total:.1f}s")
 
         # ── Record champions and survivors ────────────────────────────────
         next_level: set[int] = set()
@@ -430,7 +437,7 @@ def canonical_champion_search(
                     "new_record":   d > td,
                 }, results_file)
 
-            keep = (prune_margin is None) or (d >= td - prune_margin)
+            keep = (prune_margin is None) or (d >= keep_distance)
             if keep:
                 next_level.add(packed_j)
                 # persist so resume works
