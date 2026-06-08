@@ -36,14 +36,14 @@ __constant__ int GF8_MUL[64] = {
 extern "C" __global__ void eval_min_distance_single(
     const int* __restrict__ M,
     const int* __restrict__ s_idx,
-    int k, int tmax_zeros, int total_polys,
+    int k, int tmax_zeros, long long total_polys,
     int* out
 ) {
-    int poly_id = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    long long poly_id = (long long)blockIdx.x * blockDim.x + threadIdx.x + 1;
     if (poly_id > total_polys) return;
 
     int coeffs[16];
-    int tmp = poly_id;
+    long long tmp = poly_id;
     for (int i = 0; i < k; i++) { coeffs[i] = tmp & 7; tmp >>= 3; }
 
     int zeros = 0;
@@ -99,19 +99,17 @@ extern "C" __global__ void eval_min_distance_batch(
             M_cache[i * 49 + j] = M[s_local[i] * 49 + j];
     __syncthreads();
 
-    /* 8^k − 1 non-zero polynomials; cast via long long to avoid overflow
-       at k=10 (2^30 still fits in int32, but use ll to be safe). */
-    int total_polys = (int)((1LL << (3 * k)) - 1);
+    long long total_polys = (1LL << (3 * k)) - 1;
     int thread_max  = 0;
 
-    for (int poly_id = (int)threadIdx.x + 1;
+    for (long long poly_id = (long long)threadIdx.x + 1;
          poly_id <= total_polys;
          poly_id += blockDim.x)
     {
         if (*abort) break;  /* cooperative early exit */
 
         int coeffs[16];
-        int tmp = poly_id;
+        long long tmp = poly_id;
         for (int i = 0; i < k; i++) { coeffs[i] = tmp & 7; tmp >>= 3; }
 
         int zeros = 0;
@@ -176,7 +174,7 @@ class DistanceOracleCUDA:
             self._knl_single(
                 (grid,), (block,),
                 (self._M_gpu, s_gpu,
-                 np.int32(k), np.int32(tmax_zeros), np.int32(total_polys),
+                 np.int32(k), np.int32(tmax_zeros), np.int64(total_polys),
                  out_gpu),
             )
             cp.cuda.Device(self.device_id).synchronize()

@@ -78,7 +78,7 @@ __device__ void build_bitpat(
 extern "C" __global__ void eval_min_distance_single_bp(
     const int* __restrict__ M,
     const int* __restrict__ s_idx,
-    int k, int tmax_zeros, int total_polys,
+    int k, int tmax_zeros, long long total_polys,
     int* out
 ) {
     extern __shared__ unsigned long long smem_ull[];
@@ -87,11 +87,11 @@ extern "C" __global__ void eval_min_distance_single_bp(
     build_bitpat(bitpat, M, s_idx, k);
     __syncthreads();
 
-    int poly_id = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    long long poly_id = (long long)blockIdx.x * blockDim.x + threadIdx.x + 1;
     if (poly_id > total_polys) return;
 
     unsigned long long v0 = 0, v1 = 0, v2 = 0;
-    int tmp = poly_id;
+    long long tmp = poly_id;
     for (int i = 0; i < k; i++) {
         int c = tmp & 7; tmp >>= 3;
         v0 ^= bitpat[          i * 8 + c];
@@ -148,17 +148,17 @@ extern "C" __global__ void eval_min_distance_batch_bp(
     __syncthreads();
 
     const unsigned long long TORUS_MASK = (1ULL << 49) - 1;
-    int total_polys = (int)((1LL << (3 * k)) - 1);
+    long long total_polys = (1LL << (3 * k)) - 1;
     int thread_max  = 0;
 
-    for (int poly_id = (int)threadIdx.x + 1;
+    for (long long poly_id = (long long)threadIdx.x + 1;
          poly_id <= total_polys;
          poly_id += blockDim.x)
     {
         if (*abort_flag) break;
 
         unsigned long long v0 = 0, v1 = 0, v2 = 0;
-        int tmp = poly_id;
+        long long tmp = poly_id;
         for (int i = 0; i < k; i++) {
             int c = tmp & 7; tmp >>= 3;
             v0 ^= bitpat[          i * 8 + c];
@@ -221,7 +221,7 @@ class DistanceOracleCUDABP:
             self._knl_single(
                 (grid,), (block,),
                 (self._M_gpu, s_gpu,
-                 np.int32(k), np.int32(tmax_zeros), np.int32(total_polys),
+                 np.int32(k), np.int32(tmax_zeros), np.int64(total_polys),
                  out_gpu),
                 shared_mem=self._single_smem(k),
             )
