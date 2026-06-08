@@ -1,10 +1,13 @@
 r"""Prototype support-point CNN estimator for GF(8) toric-code searches.
 
-This module is intentionally lightweight: it uses NumPy only and implements a
-small CNN-style feature extractor (fixed 3x3 convolution filters, support-mask,
-row/column, and pairwise-geometry summaries) followed by standardized ridge
-regression.  It is meant to rank candidate support sets/extensions before
-expensive exact distance evaluation, not to certify code distances.
+This module is intentionally lightweight by default: the ridge backend uses
+NumPy only and implements a small CNN-style feature extractor (fixed 3x3
+convolution filters, support-mask, row/column, and pairwise-geometry summaries)
+followed by standardized ridge regression.  For Kaggle GPU notebooks there is
+also an optional PyTorch backend that trains a small learnable 7x7 CNN on CUDA
+when torch + a CUDA device are available.  Both paths are meant to rank
+candidate support sets/extensions before expensive exact distance evaluation,
+not to certify code distances.
 
 Examples
 --------
@@ -35,7 +38,7 @@ import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 
@@ -397,6 +400,266 @@ def _example_balance_weights(examples: Sequence[Example], balance_by: str) -> np
     return weights / float(weights.mean())
 
 
+def _import_torch() -> Any:
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - depends on optional local/Kaggle environment
+        raise RuntimeError(
+            "PyTorch is required for the torch/CUDA training backend. "
+            "Kaggle GPU notebooks usually include torch; locally install a CUDA-enabled "
+            "PyTorch build or use --backend ridge."
+        ) from exc
+    return torch
+
+
+def torch_cuda_available() -> bool:
+    """Return True when the optional PyTorch backend can see a CUDA GPU."""
+    try:
+        torch = _import_torch()
+    except RuntimeError:
+        return False
+    return bool(torch.cuda.is_available())
+
+
+def _make_torch_support_point_cnn(torch: Any, channels: int = 48, hidden: int = 128, dropout: float = 0.05) -> Any:
+    """Construct a tiny learnable CNN without importing torch at module import time."""
+
+    class SupportPointTorchCNN(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = torch.nn.Sequential(
+                torch.nn.Conv2d(1, channels, kernel_size=3, padding=1),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+                torch.nn.ReLU(),
+                torch.nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+                torch.nn.ReLU(),
+            )
+            self.head = torch.nn.Sequential(
+                torch.nn.Linear(channels * GRID * GRID + 1, hidden),
+                torch.nn.ReLU(),
+                torch.nn.Dropout(dropout),
+                torch.nn.Linear(hidden, max(16, hidden // 2)),
+                torch.nn.ReLU(),
+                torch.nn.Linear(max(16, hidden // 2), 1),
+            )
+
+        def forward(self, x: Any) -> Any:
+            z = self.conv(x).flatten(1)
+            k_norm = x.sum(dim=(1, 2, 3), keepdim=False).unsqueeze(1) / float(N_POINTS)
+            return self.head(torch.cat([z, k_norm], dim=1)).squeeze(1)
+
+    return SupportPointTorchCNN()
+
+
+@dataclass
+class TorchCnnEstimator:
+    """Optional PyTorch/CUDA support-mask CNN regressor.
+
+    The class deliberately mirrors ``RidgeCnnEstimator``'s prediction API so the
+    notebook can switch between CPU ridge and GPU torch training without
+    changing downstream ranking/evaluation cells.
+    """
+
+    model: Any
+    target_mean: float
+    target_std: float
+    device: str
+    model_kwargs: dict[str, Any]
+    epochs: int = 0
+
+    def predict_masks(self, masks: np.ndarray, batch_size: int = 4096) -> np.ndarray:
+        torch = _import_torch()
+        device = torch.device(self.device)
+        self.model.to(device)
+        self.model.eval()
+        outputs: list[np.ndarray] = []
+        arr = masks.astype(np.float32, copy=False)[:, None, :, :]
+        with torch.no_grad():
+            for start in range(0, len(arr), batch_size):
+                xb = torch.from_numpy(arr[start : start + batch_size]).to(device)
+                pred_scaled = self.model(xb).detach().cpu().numpy().astype(np.float64)
+                outputs.append(pred_scaled * self.target_std + self.target_mean)
+        return np.concatenate(outputs) if outputs else np.asarray([], dtype=np.float64)
+
+    def predict_indices(self, supports: Sequence[Sequence[int]]) -> np.ndarray:
+        masks = np.stack([mask_from_indices(s) for s in supports])
+        return self.predict_masks(masks)
+
+    def save(self, path: Path) -> None:
+        torch = _import_torch()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model_type": "TorchSupportPointCNN",
+                "state_dict": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
+                "target_mean": self.target_mean,
+                "target_std": self.target_std,
+                "device": self.device,
+                "model_kwargs": self.model_kwargs,
+                "epochs": self.epochs,
+                "grid": GRID,
+                "n_points": N_POINTS,
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: Path, device: str = "auto") -> "TorchCnnEstimator":
+        torch = _import_torch()
+        chosen = _select_torch_device(torch, device)
+        payload = torch.load(path, map_location=chosen)
+        model_kwargs = dict(payload.get("model_kwargs", {}))
+        model = _make_torch_support_point_cnn(torch, **model_kwargs)
+        model.load_state_dict(payload["state_dict"])
+        model.to(chosen)
+        model.eval()
+        return cls(
+            model=model,
+            target_mean=float(payload["target_mean"]),
+            target_std=float(payload["target_std"]),
+            device=str(chosen),
+            model_kwargs=model_kwargs,
+            epochs=int(payload.get("epochs", 0)),
+        )
+
+
+def _select_torch_device(torch: Any, device: str) -> Any:
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    chosen = torch.device(device)
+    if chosen.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("requested CUDA torch backend, but torch.cuda.is_available() is false")
+    return chosen
+
+
+def train_torch_cnn_estimator(
+    examples: Sequence[Example],
+    *,
+    val_examples: Sequence[Example] | None = None,
+    balance_by: str = "none",
+    epochs: int = 300,
+    batch_size: int = 256,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    patience: int = 60,
+    seed: int = 1,
+    device: str = "auto",
+    channels: int = 48,
+    hidden: int = 128,
+    dropout: float = 0.05,
+    verbose: bool = False,
+) -> tuple[TorchCnnEstimator, list[dict[str, float]]]:
+    """Train a small learnable support-mask CNN with PyTorch.
+
+    On Kaggle GPU runtimes ``device='auto'`` selects CUDA; local CPU-only
+    environments remain usable for smoke tests by selecting CPU.  The returned
+    estimator exposes the same ``predict_indices`` method as the ridge backend.
+    """
+    if not examples:
+        raise ValueError("no training examples found")
+    torch = _import_torch()
+    chosen = _select_torch_device(torch, device)
+    torch.manual_seed(seed)
+    if chosen.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    masks_np = np.stack([mask_from_indices(ex.indices) for ex in examples]).astype(np.float32)[:, None, :, :]
+    y_np = np.asarray([ex.target for ex in examples], dtype=np.float32)
+    sample_weight = _example_balance_weights(examples, balance_by)
+    if sample_weight is None:
+        target_mean = float(y_np.mean())
+        target_std = float(y_np.std() or 1.0)
+        weight_np = np.ones_like(y_np, dtype=np.float32)
+    else:
+        weight_np = sample_weight.astype(np.float32)
+        wsum = float(weight_np.sum())
+        target_mean = float(np.sum(weight_np * y_np) / wsum)
+        target_std = float(math.sqrt(np.sum(weight_np * (y_np - target_mean) ** 2) / wsum) or 1.0)
+    y_scaled_np = ((y_np - target_mean) / target_std).astype(np.float32)
+
+    X = torch.from_numpy(masks_np).to(chosen)
+    y = torch.from_numpy(y_scaled_np).to(chosen)
+    weights = torch.from_numpy(weight_np).to(chosen)
+    model_kwargs = {"channels": int(channels), "hidden": int(hidden), "dropout": float(dropout)}
+    model = _make_torch_support_point_cnn(torch, **model_kwargs).to(chosen)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    if val_examples:
+        val_masks_np = np.stack([mask_from_indices(ex.indices) for ex in val_examples]).astype(np.float32)[:, None, :, :]
+        val_y_np = np.asarray([ex.target for ex in val_examples], dtype=np.float32)
+        X_val = torch.from_numpy(val_masks_np).to(chosen)
+        y_val = torch.from_numpy(((val_y_np - target_mean) / target_std).astype(np.float32)).to(chosen)
+    else:
+        X_val = y_val = None
+
+    n = len(examples)
+    batch_size = max(1, min(int(batch_size), n))
+    patience = max(1, int(patience))
+    history: list[dict[str, float]] = []
+    best_score = float("inf")
+    best_epoch = 0
+    best_state: dict[str, Any] | None = None
+
+    if verbose:
+        dev_name = torch.cuda.get_device_name(chosen) if chosen.type == "cuda" else "CPU"
+        print(f"Torch CNN training device: {chosen} ({dev_name}); train={n}; val={len(val_examples or [])}")
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        perm = torch.randperm(n, device=chosen)
+        epoch_loss = 0.0
+        seen = 0
+        for start in range(0, n, batch_size):
+            idx = perm[start : start + batch_size]
+            optimizer.zero_grad(set_to_none=True)
+            pred = model(X[idx])
+            loss = ((pred - y[idx]) ** 2 * weights[idx]).mean()
+            loss.backward()
+            optimizer.step()
+            bs = int(idx.numel())
+            epoch_loss += float(loss.detach().cpu()) * bs
+            seen += bs
+        train_mse_scaled = epoch_loss / max(seen, 1)
+
+        model.eval()
+        with torch.no_grad():
+            train_pred = model(X)
+            train_mae = float((torch.abs(train_pred - y) * target_std).mean().detach().cpu())
+            if X_val is not None and y_val is not None:
+                val_pred = model(X_val)
+                val_mae = float((torch.abs(val_pred - y_val) * target_std).mean().detach().cpu())
+            else:
+                val_mae = train_mae
+        row = {"epoch": float(epoch), "train_mse_scaled": train_mse_scaled, "train_mae": train_mae, "validation_mae": val_mae}
+        history.append(row)
+
+        score = val_mae
+        if score + 1e-9 < best_score:
+            best_score = score
+            best_epoch = epoch
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        elif epoch - best_epoch >= patience:
+            if verbose:
+                print(f"Early stopping at epoch {epoch}; best_epoch={best_epoch}; best_validation_mae={best_score:.3f}")
+            break
+
+        if verbose and (epoch == 1 or epoch % 25 == 0 or epoch == int(epochs)):
+            print(f"epoch={epoch:4d} train_MAE={train_mae:.3f} validation_MAE={val_mae:.3f}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    estimator = TorchCnnEstimator(
+        model=model,
+        target_mean=target_mean,
+        target_std=target_std,
+        device=str(chosen),
+        model_kwargs=model_kwargs,
+        epochs=best_epoch,
+    )
+    return estimator, history
+
+
 def train_estimator(examples: Sequence[Example], ridge: float = 1e-2, balance_by: str = "none") -> RidgeCnnEstimator:
     if not examples:
         raise ValueError("no training examples found")
@@ -549,7 +812,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--data", nargs="*", type=Path, help="JSONL/JSON/CSV result files with indices and min_distance/max_zeros")
     parser.add_argument("--target-field", default="min_distance", help="record field to learn (default: min_distance)")
     parser.add_argument("--model-out", type=Path, default=Path("support_point_cnn_model.npz"))
-    parser.add_argument("--model-in", type=Path, help="load an existing .npz model instead of training")
+    parser.add_argument("--model-in", type=Path, help="load an existing .npz ridge model or .pt torch model instead of training")
+    parser.add_argument("--backend", choices=["ridge", "torch"], default="ridge", help="training backend: CPU ridge or optional PyTorch CNN")
     parser.add_argument("--ridge", type=float, default=1e-2)
     parser.add_argument(
         "--balance-by",
@@ -562,14 +826,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-stratify-split", action="store_true", help="use a plain random validation split")
     parser.add_argument("--smoke-test", action="store_true", help="use synthetic data so the workflow can be validated without search output")
     parser.add_argument("--smoke-count", type=int, default=96)
-    parser.add_argument("--epochs", type=int, default=1, help="accepted for compatibility; ridge fit is closed-form")
+    parser.add_argument("--epochs", type=int, default=300, help="torch epochs; ignored by the closed-form ridge backend")
+    parser.add_argument("--batch-size", type=int, default=256, help="torch mini-batch size")
+    parser.add_argument("--lr", type=float, default=1e-3, help="torch AdamW learning rate")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="torch AdamW weight decay")
+    parser.add_argument("--patience", type=int, default=60, help="torch early-stopping patience in epochs")
+    parser.add_argument("--device", default="auto", help="torch device: auto, cpu, cuda, cuda:0, ...")
     parser.add_argument("--score-base", help="comma-separated support indices; ranks all one-point extensions")
     parser.add_argument("--top", type=int, default=10)
     args = parser.parse_args(argv)
 
-    estimator: RidgeCnnEstimator
+    estimator: Any
     if args.model_in:
-        estimator = RidgeCnnEstimator.load(args.model_in)
+        if args.model_in.suffix.lower() in {".pt", ".pth"}:
+            try:
+                estimator = TorchCnnEstimator.load(args.model_in, device=args.device)
+            except RuntimeError as exc:
+                raise SystemExit(str(exc)) from exc
+        else:
+            estimator = RidgeCnnEstimator.load(args.model_in)
         print(f"Loaded model: {args.model_in}")
     else:
         if args.smoke_test:
@@ -581,7 +856,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not examples:
             raise SystemExit("No usable examples found (need indices plus min_distance/max_zeros).")
         train, val = train_validation_split(examples, args.val_fraction, args.seed, stratify=not args.no_stratify_split)
-        estimator = train_estimator(train, ridge=args.ridge, balance_by=args.balance_by)
+        if args.backend == "torch":
+            if args.model_out == Path("support_point_cnn_model.npz"):
+                args.model_out = Path("support_point_torch_cnn_model.pt")
+            try:
+                estimator, history = train_torch_cnn_estimator(
+                    train,
+                    val_examples=val,
+                    balance_by=args.balance_by,
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    lr=args.lr,
+                    weight_decay=args.weight_decay,
+                    patience=args.patience,
+                    seed=args.seed,
+                    device=args.device,
+                    verbose=True,
+                )
+            except RuntimeError as exc:
+                raise SystemExit(str(exc)) from exc
+            if history:
+                best = min(history, key=lambda row: row["validation_mae"])
+                print(f"Best torch epoch={int(best['epoch'])} validation_MAE={best['validation_mae']:.3f}")
+        else:
+            estimator = train_estimator(train, ridge=args.ridge, balance_by=args.balance_by)
         estimator.save(args.model_out)
         train_metrics = evaluate(estimator, train)
         val_metrics = evaluate(estimator, val)

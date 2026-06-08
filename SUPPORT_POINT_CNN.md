@@ -10,13 +10,20 @@ keep validating selected supports with the exact OpenCL/CUDA distance oracle.
 
 ## Dependencies
 
-No new required dependency is needed beyond the existing project `requirements.txt`.
-The prototype uses NumPy only.  It implements fixed 3x3 convolutional summaries,
-row/column occupancy, raw 7x7 mask pixels, pairwise support-geometry features,
-and a standardized closed-form ridge-regression head, so it runs on CPU without
-PyTorch/TensorFlow.
+No new required dependency is needed for the default CLI ridge workflow beyond
+the existing project `requirements.txt`.  The ridge backend uses NumPy only: fixed
+3x3 convolutional summaries, row/column occupancy, raw 7x7 mask pixels, pairwise
+support-geometry features, and a standardized closed-form ridge-regression head.
+It is CPU-only by design.
 
-Generated `.npz` model files are local artifacts and can be safely deleted.
+For Kaggle GPU notebooks there is also an optional PyTorch backend
+(`--backend torch`, notebook `TRAINING_BACKEND = "torch"`) that trains a small
+learnable 7x7 support-mask CNN on CUDA when PyTorch can see a GPU.  Kaggle GPU
+runtimes usually include PyTorch already; local CPU-only environments can keep
+using `--backend ridge`.
+
+Generated `.npz` ridge and `.pt` torch model files are local artifacts and can be
+safely deleted.
 
 ## External datasets and local artifacts
 
@@ -42,9 +49,14 @@ as a fallback for `min_distance`.
 ## Quick validation
 
 ```bash
-python support_point_cnn_estimator.py --smoke-test --epochs 1 \
+python support_point_cnn_estimator.py --smoke-test --backend ridge \
   --model-out /tmp/support_point_cnn_model.npz \
   --score-base 0,1,8,9 --top 5
+
+# Optional PyTorch path.  On Kaggle GPU this should print a cuda device;
+# locally it requires a PyTorch install and may fall back/error if CUDA is absent.
+python support_point_cnn_estimator.py --smoke-test --backend torch --epochs 50 \
+  --model-out /tmp/support_point_torch_cnn_model.pt
 ```
 
 ## Train from search output or external exact labels
@@ -66,6 +78,12 @@ python support_point_cnn_estimator.py \
 python support_point_cnn_estimator.py \
   --data 'cnnruns/support_point_cnn_predictions(1).csv' \
   --model-out /tmp/support_point_cnn_from_predictions_csv.npz
+
+# GPU CNN training from the same labels on Kaggle:
+python support_point_cnn_estimator.py --backend torch --device auto --epochs 500 \
+  --data data/external/support_point_cuda_bp_labeled.jsonl \
+  --balance-by k-target \
+  --model-out /tmp/support_point_torch_cnn_model.pt
 ```
 
 ## Avoiding constant/per-k-mean predictors
@@ -80,6 +98,13 @@ standard deviation, and prediction standard deviation so local runs are directly
 comparable with the Kaggle notebook/prediction CSV metrics.  Always inspect label
 counts by `k` and prediction standard deviation before trusting a ranking run;
 CNN predictions are heuristic triage scores only.
+
+If GPU usage looks near zero in older Kaggle notebooks, check the selected
+training backend.  The original training cell was NumPy ridge and therefore used
+CPU; the GPU was only used by the exact CUDA-BP labeling/re-check cells, often
+for very short bursts.  The torch backend should print `Torch CNN training
+device: cuda...`, but utilization can still be bursty because the 7x7 model and
+2k-row datasets are tiny.
 
 ## Rank extensions with a saved model
 
